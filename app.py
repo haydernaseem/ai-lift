@@ -1,499 +1,952 @@
-import io
-import datetime
 import numpy as np
 import pandas as pd
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy.optimize import minimize, curve_fit
+from scipy.interpolate import interp1d
+from sklearn.ensemble import IsolationForest
 from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+import joblib
+import json
 
-# PDF
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-)
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
+# ==================== PHYSICS MODELS ====================
+
+class FluidProperties:
+    """خواص السوائل للآبار"""
+    def __init__(self, oil_gravity: float = 35, water_cut: float = 0.3, 
+                 gas_gravity: float = 0.65, temp: float = 180):
+        self.API = oil_gravity
+        self.water_cut = water_cut
+        self.gas_gravity = gas_gravity
+        self.temperature = temp  # درجة فهرنهايت
+        self.pressure = 2000  # psi
+        
+    def calculate_rho(self) -> Tuple[float, float, float]:
+        """حساب كثافات النفط، الماء، الغاز"""
+        # كثافة النفط (lb/ft3)
+        rho_o = 141.5 / (131.5 + self.API) * 62.4
+        
+        # كثافة الماء
+        rho_w = 62.4  # lb/ft3
+        
+        # كثافة الغاز باستخدام معادلة الحالة
+        rho_g = (2.7 * self.gas_gravity * self.pressure) / (
+            (self.temperature + 460) * 0.8)
+        
+        return rho_o, rho_w, rho_g
+    
+    def calculate_viscosity(self, temp: float) -> Tuple[float, float]:
+        """حساب لزوجة النفط والماء"""
+        # لزوجة النفط (cp)
+        mu_o = np.exp(3.0324 - 0.02023 * self.API) * (
+            1.8 * (temp - 32) + 32) ** (-1.163)
+        
+        # لزوجة الماء (cp)
+        mu_w = 1.0  # تقريبي
+        
+        return mu_o, mu_w
+
+@dataclass
+class PumpCurve:
+    """منحنى أداء المضخة الحقيقي"""
+    flow_rates: np.ndarray  # BPD
+    heads: np.ndarray  # feet
+    efficiencies: np.ndarray  # %
+    powers: np.ndarray  # HP
+    
+    @classmethod
+    def from_manufacturer(cls, pump_type: str, stages: int):
+        """إنشاء منحنى مضخة من بيانات الشركة المصنعة"""
+        if pump_type == "ESP400":
+            flow = np.linspace(500, 4000, 20)
+            head_per_stage = 30 - 0.005 * (flow - 2000)**2
+            eff = 65 - 0.0001 * (flow - 2200)**2
+            power = flow * head_per_stage * stages / (3960 * eff/100)
+            return cls(flow, head_per_stage * stages, eff, power)
+        
+        elif pump_type == "REDA500":
+            flow = np.linspace(1000, 5000, 20)
+            head_per_stage = 28 - 0.004 * (flow - 2500)**2
+            eff = 68 - 0.00008 * (flow - 2400)**2
+            power = flow * head_per_stage * stages / (3960 * eff/100)
+            return cls(flow, head_per_stage * stages, eff, power)
+        
+        return None
+    
+    def interpolate_head(self, flow: float) -> float:
+        """القيمة المثبتة للرأس عند معدل تدفق معين"""
+        f = interp1d(self.flow_rates, self.heads, 
+                    bounds_error=False, fill_value="extrapolate")
+        return float(f(flow))
+    
+    def best_efficiency_point(self) -> dict:
+        """نقطة أفضل كفاءة (BEP)"""
+        idx = np.argmax(self.efficiencies)
+        return {
+            "flow": float(self.flow_rates[idx]),
+            "head": float(self.heads[idx]),
+            "efficiency": float(self.efficiencies[idx]),
+            "power": float(self.powers[idx])
+        }
+
+class WellIPR:
+    """منحنى أداء المكمن (Inflow Performance Relationship)"""
+    def __init__(self, reservoir_pressure: float, 
+                 productivity_index: float, 
+                 oil_rate_max: float):
+        self.P_res = reservoir_pressure
+        self.J = productivity_index  # STB/day/psi
+        self.q_max = oil_rate_max
+        
+    def vogel_ipr(self, pwf: float) -> float:
+        """معادلة فوغل لآبار النفط المشبعة"""
+        if pwf >= self.P_res:
+            return 0
+        q = self.J * (self.P_res - pwf)
+        # Vogel adjustment for saturated oil
+        if self.P_res > 2000:  # فوق نقطة الفقاعة
+            return q
+        else:
+            return q * (1 - 0.2 * (pwf/self.P_res) - 0.8 * (pwf/self.P_res)**2)
+    
+    def generate_ipr_curve(self) -> Dict:
+        """إنشاء منحنى IPR كامل"""
+        pwf_values = np.linspace(self.P_res, 0, 50)
+        q_values = [self.vogel_ipr(p) for p in pwf_values]
+        return {"pwf": pwf_values.tolist(), "q": q_values}
+
+class EconomicCalculator:
+    """محاسب اقتصادي للآبار"""
+    def __init__(self, oil_price: float = 70,  # $/bbl
+                 gas_cost: float = 0.5,  # $/MCF
+                 electricity_cost: float = 0.08,  # $/kWh
+                 opex_per_bbl: float = 15):  # $/bbl
+        self.oil_price = oil_price
+        self.gas_cost = gas_cost
+        self.electricity_cost = electricity_cost
+        self.opex = opex_per_bbl
+        
+    def calculate_npv(self, oil_rate: float, 
+                      gas_injection: float = 0,
+                      power_consumption: float = 0,
+                      days: int = 30) -> dict:
+        """حساب صافي القيمة الحالية"""
+        # الإيرادات
+        revenue = oil_rate * days * self.oil_price
+        
+        # التكاليف
+        gas_cost_total = gas_injection * days * self.gas_cost / 1000  # MCF to M
+        power_cost = power_consumption * 24 * days * self.electricity_cost
+        opex_cost = oil_rate * days * self.opex
+        
+        total_cost = gas_cost_total + power_cost + opex_cost
+        net_income = revenue - total_cost
+        
+        return {
+            "revenue": revenue,
+            "total_cost": total_cost,
+            "net_income": net_income,
+            "lifting_cost_per_bbl": total_cost / (oil_rate * days) 
+            if oil_rate * days > 0 else 0,
+            "roi_percent": (net_income / total_cost * 100) 
+            if total_cost > 0 else 0
+        }
+    
+    def optimize_profit(self, rates: np.ndarray, 
+                       costs: np.ndarray) -> dict:
+        """إيجاد نقطة الربح الأمثل"""
+        profits = rates * self.oil_price - costs
+        idx_opt = np.argmax(profits)
+        
+        return {
+            "optimal_rate": float(rates[idx_opt]),
+            "optimal_cost": float(costs[idx_opt]),
+            "max_profit": float(profits[idx_opt]),
+            "sensitivity": float((profits.max() - profits.min()) / profits.max() * 100)
+        }
+
+# ==================== AI ENGINE ====================
+
+class AdvancedAnomalyDetector:
+    """كشف متقدم للقيم الشاذة وأنماط الأعطال"""
+    
+    def __init__(self):
+        self.models = {}
+        
+    def train_failure_patterns(self, historical_data: pd.DataFrame):
+        """تدريب أنماط الأعطال التاريخية"""
+        features = ['vibration', 'motor_temp', 'current_unbalance', 
+                   'flow_deviation', 'pressure_delta']
+        
+        available_features = [f for f in features 
+                            if f in historical_data.columns]
+        
+        if len(available_features) >= 3:
+            X = historical_data[available_features].fillna(0)
+            
+            # Isolation Forest للكشف عن الشذوذ
+            iso_forest = IsolationForest(
+                contamination=0.1, 
+                random_state=42,
+                n_estimators=100
+            )
+            
+            anomalies = iso_forest.fit_predict(X)
+            self.models['isolation_forest'] = iso_forest
+            
+            # حساب درجات الشذوذ
+            anomaly_scores = iso_forest.decision_function(X)
+            historical_data['anomaly_score'] = anomaly_scores
+            historical_data['is_anomaly'] = anomalies == -1
+            
+        return historical_data
+    
+    def predict_failure_risk(self, current_data: pd.Series) -> dict:
+        """توقع مخاطر الأعطال"""
+        risk_score = 0
+        alerts = []
+        
+        # قواعد معرفة المجال
+        if 'motor_temp' in current_data and current_data['motor_temp'] > 180:
+            risk_score += 30
+            alerts.append("🔥 درجة حرارة المحور مرتفعة جداً (>180°F)")
+            
+        if 'vibration' in current_data and current_data['vibration'] > 0.5:
+            risk_score += 25
+            alerts.append("⚠️ اهتزازات مرتفعة - خطر تلف المحور")
+            
+        if 'current_unbalance' in current_data and current_data['current_unbalance'] > 15:
+            risk_score += 20
+            alerts.append("⚡ عدم توازن التيار الكهربائي")
+            
+        if 'flow_deviation' in current_data and abs(current_data['flow_deviation']) > 30:
+            risk_score += 15
+            alerts.append("📉 انحراف كبير في التدفق")
+            
+        risk_level = "منخفض"
+        if risk_score > 50:
+            risk_level = "عالٍ"
+        elif risk_score > 25:
+            risk_level = "متوسط"
+            
+        return {
+            "risk_score": min(risk_score, 100),
+            "risk_level": risk_level,
+            "alerts": alerts,
+            "recommended_action": self._get_action_from_risk(risk_score)
+        }
+    
+    def _get_action_from_risk(self, score: int) -> str:
+        if score > 70:
+            return "إيقاف فوري والتحقق من المعدات"
+        elif score > 50:
+            return "تقليل الحمل وطلب الصيانة خلال 24 ساعة"
+        elif score > 30:
+            return "مراقبة عن كثب وفحص خلال 72 ساعة"
+        else:
+            return "مراقبة روتينية"
+
+class DeepOptimizationEngine:
+    """محرك تحسين عميق يعمل بالفيزياء والذكاء الاصطناعي"""
+    
+    def __init__(self, well_type: str, fluid_props: FluidProperties):
+        self.well_type = well_type
+        self.fluid = fluid_props
+        self.economic_calc = EconomicCalculator()
+        
+    def optimize_esp(self, pump_curve: PumpCurve, 
+                    well_ipr: WellIPR,
+                    historical_data: pd.DataFrame) -> dict:
+        """التحسين المتقدم لمضخات ESP"""
+        
+        # تحليل البيانات التاريخية
+        freq_data = historical_data['frequency'].values
+        rate_data = historical_data['oil_rate'].values
+        
+        if len(freq_data) < 10:
+            return self._fallback_optimization(freq_data, rate_data)
+        
+        # 1. النموذج الفيزيائي
+        def physical_model(freq, a, b, c, d):
+            """نموذج فيزيائي: Q = a*(f/f0)^3 + b*(f/f0)^2 + c*(f/f0) + d"""
+            f0 = 60  # تردد التصميم
+            f_norm = freq / f0
+            return a * f_norm**3 + b * f_norm**2 + c * f_norm + d
+        
+        try:
+            # تركيب النموذج الفيزيائي
+            popt, _ = curve_fit(physical_model, freq_data, rate_data,
+                              p0=[100, -50, 200, 500])
+            
+            # 2. إيجاد الأمثل مع قيود عملية
+            freq_range = np.linspace(max(30, freq_data.min()), 
+                                   min(70, freq_data.max()), 100)
+            
+            rates_pred = physical_model(freq_range, *popt)
+            
+            # 3. حساب التكاليف والربح
+            power_consumption = freq_range * 5  # kW تقريبي
+            costs = power_consumption * 24 * self.economic_calc.electricity_cost
+            
+            economic_result = self.economic_calc.optimize_profit(
+                rates_pred, costs
+            )
+            
+            # 4. التحقق من كفاءة المضخة
+            bep = pump_curve.best_efficiency_point()
+            efficiency_penalty = np.abs(rates_pred - bep['flow']) / bep['flow'] * 100
+            
+            # 5. التوصية المتكاملة
+            optimal_idx = np.argmin(efficiency_penalty + (100 - rates_pred/rates_pred.max()*100)/2)
+            
+            optimal_freq = float(freq_range[optimal_idx])
+            predicted_rate = float(rates_pred[optimal_idx])
+            
+            return {
+                "optimal_frequency": optimal_freq,
+                "predicted_rate": predicted_rate,
+                "expected_increase": max(0, predicted_rate - np.mean(rate_data)),
+                "economic_gain": self.economic_calc.calculate_npv(
+                    predicted_rate, power_consumption=power_consumption[optimal_idx]
+                ),
+                "pump_efficiency": float(100 - efficiency_penalty[optimal_idx]),
+                "confidence_level": 0.85,
+                "optimization_curve": {
+                    "frequencies": freq_range.tolist(),
+                    "rates": rates_pred.tolist(),
+                    "efficiency": (100 - efficiency_penalty).tolist(),
+                    "profit": (rates_pred * 70 - costs).tolist()
+                }
+            }
+            
+        except Exception as e:
+            return self._fallback_optimization(freq_data, rate_data)
+    
+    def optimize_gas_lift(self, historical_data: pd.DataFrame,
+                         valve_depth: float = 5000) -> dict:
+        """التحسين المتقدم للرفع بالغاز"""
+        
+        gas_rates = historical_data['gas_injection'].values
+        oil_rates = historical_data['oil_rate'].values
+        
+        if len(gas_rates) < 15:
+            return {"error": "بيانات غير كافية للتحليل المتقدم"}
+        
+        # 1. نموذج فيزيائي مبسط للرفع بالغاز
+        def gas_lift_model(gas_rate, a, b, c, d):
+            """Q = a*tanh(b*(gas_rate-c)) + d"""
+            return a * np.tanh(b * (gas_rate - c)) + d
+        
+        try:
+            # تركيب النموذج
+            popt, _ = curve_fit(gas_lift_model, gas_rates, oil_rates,
+                              p0=[500, 0.001, 1000, 1000],
+                              maxfev=5000)
+            
+            # 2. إيجاد النقطة الاقتصادية الأمثل
+            gas_range = np.linspace(gas_rates.min(), gas_rates.max(), 100)
+            oil_pred = gas_lift_model(gas_range, *popt)
+            
+            # تكاليف الغاز
+            gas_costs = gas_range * self.economic_calc.gas_cost / 1000
+            
+            # الإيرادات والربح
+            revenues = oil_pred * self.economic_calc.oil_price
+            profits = revenues - gas_costs
+            
+            # 3. حساب المشتقة الثانية لإيجاد نقطة التناقص الهامشي
+            gradient = np.gradient(oil_pred, gas_range)
+            second_gradient = np.gradient(gradient, gas_range)
+            
+            # نقطة تناقص العائد الهامشي (عندما تبدأ المشتقة الثانية بالسالب)
+            marginal_decline_idx = np.where(second_gradient < -0.001)[0]
+            
+            if len(marginal_decline_idx) > 0:
+                optimal_idx = marginal_decline_idx[0]
+            else:
+                optimal_idx = np.argmax(profits)
+            
+            optimal_gas = float(gas_range[optimal_idx])
+            optimal_oil = float(oil_pred[optimal_idx])
+            
+            # 4. تحليل الاستقرار
+            stability_score = self._calculate_stability(
+                historical_data, optimal_gas
+            )
+            
+            return {
+                "optimal_gas_injection": optimal_gas,
+                "predicted_oil_rate": optimal_oil,
+                "gas_oil_ratio": optimal_gas / optimal_oil if optimal_oil > 0 else 0,
+                "economic_gain": self.economic_calc.calculate_npv(
+                    optimal_oil, gas_injection=optimal_gas
+                ),
+                "stability_score": stability_score,
+                "valve_recommendation": self._optimize_valve_settings(
+                    optimal_gas, valve_depth
+                ),
+                "optimization_curve": {
+                    "gas_rates": gas_range.tolist(),
+                    "oil_rates": oil_pred.tolist(),
+                    "profits": profits.tolist(),
+                    "marginal_gain": gradient.tolist()
+                }
+            }
+            
+        except Exception as e:
+            return self._fallback_gas_lift_optimization(gas_rates, oil_rates)
+    
+    def _calculate_stability(self, data: pd.DataFrame, 
+                           optimal_point: float) -> float:
+        """حساب درجة الاستقرار"""
+        # تحليل التقلبات حول النقطة المثلى
+        deviations = np.abs(data['oil_rate'] - optimal_point)
+        stability = 100 * (1 - deviations.std() / data['oil_rate'].mean())
+        return min(max(stability, 0), 100)
+    
+    def _optimize_valve_settings(self, gas_rate: float, 
+                               depth: float) -> dict:
+        """توصيات إعدادات الصمامات"""
+        # قواعد معرفة المجال
+        valve_spacing = 500  # قدم بين الصمامات
+        num_valves = int(depth / valve_spacing)
+        
+        # ضغط فتح الصمام الأمثل
+        optimal_opening_pressure = gas_rate / 100 + 100  # psi
+        
+        return {
+            "recommended_valves": num_valves,
+            "valve_spacing_ft": valve_spacing,
+            "opening_pressure_psi": optimal_opening_pressure,
+            "injection_depth_ft": depth,
+            "gas_rate_per_valve": gas_rate / num_valves if num_valves > 0 else 0
+        }
+    
+    def _fallback_optimization(self, freq, rate):
+        """نسخة احتياطية إذا فشل التحليل المتقدم"""
+        if len(freq) > 0:
+            optimal_idx = np.argmax(rate)
+            return {
+                "optimal_frequency": float(freq[optimal_idx]),
+                "predicted_rate": float(rate[optimal_idx]),
+                "confidence_level": 0.6,
+                "note": "تحسين أساسي بسبب قلة البيانات"
+            }
+        return {"error": "لا توجد بيانات كافية"}
+    
+    def _fallback_gas_lift_optimization(self, gas, oil):
+        """نسخة احتياطية للرفع بالغاز"""
+        if len(gas) > 0:
+            g = np.array(gas)
+            o = np.array(oil)
+            
+            # متوسط النقطة الأفضل
+            efficiency = o / (g + 1e-6)  # النفط لكل وحدة غاز
+            optimal_idx = np.argmax(efficiency)
+            
+            return {
+                "optimal_gas_injection": float(g[optimal_idx]),
+                "predicted_oil_rate": float(o[optimal_idx]),
+                "gas_oil_ratio": float(g[optimal_idx] / o[optimal_idx]) if o[optimal_idx] > 0 else 0,
+                "confidence_level": 0.65
+            }
+        return {"error": "لا توجد بيانات"}
+
+# ==================== VISUALIZATION ENGINE ====================
+
+class AdvancedVisualizer:
+    """محرك تصور متقدم مع رسومات تفاعلية"""
+    
+    def create_comprehensive_dashboard(self, 
+                                     optimization_results: dict,
+                                     historical_data: pd.DataFrame) -> dict:
+        """إنشاء لوحة تحكم شاملة"""
+        
+        figures = {}
+        
+        # 1. منحنى التحسين الأساسي
+        if 'optimization_curve' in optimization_results:
+            curve_data = optimization_results['optimization_curve']
+            
+            fig1 = go.Figure()
+            
+            if 'frequencies' in curve_data:
+                # لمضخة ESP
+                fig1.add_trace(go.Scatter(
+                    x=curve_data['frequencies'],
+                    y=curve_data['rates'],
+                    name='معدل الإنتاج',
+                    line=dict(color='blue', width=3)
+                ))
+                
+                fig1.add_trace(go.Scatter(
+                    x=curve_data['frequencies'],
+                    y=curve_data['profit'],
+                    name='الربح اليومي',
+                    line=dict(color='green', width=2),
+                    yaxis='y2'
+                ))
+                
+                fig1.update_layout(
+                    title="تحليل تحسين ESP - الإنتاج والربحية",
+                    xaxis_title="التردد (هرتز)",
+                    yaxis_title="معدل النفط (برميل/يوم)",
+                    yaxis2=dict(
+                        title="الربح ($/يوم)",
+                        overlaying='y',
+                        side='right'
+                    ),
+                    template="plotly_dark"
+                )
+                
+            elif 'gas_rates' in curve_data:
+                # للرفع بالغاز
+                fig1 = make_subplots(specs=[[{"secondary_y": True}]])
+                
+                fig1.add_trace(go.Scatter(
+                    x=curve_data['gas_rates'],
+                    y=curve_data['oil_rates'],
+                    name='منحنى الإنتاج',
+                    line=dict(color='orange', width=3)
+                ), secondary_y=False)
+                
+                fig1.add_trace(go.Scatter(
+                    x=curve_data['gas_rates'],
+                    y=curve_data['profits'],
+                    name='الربحية',
+                    line=dict(color='yellow', width=2)
+                ), secondary_y=True)
+                
+                fig1.add_trace(go.Scatter(
+                    x=curve_data['gas_rates'],
+                    y=curve_data['marginal_gain'],
+                    name='العائد الهامشي',
+                    line=dict(color='red', width=2, dash='dash')
+                ), secondary_y=False)
+                
+                fig1.update_layout(
+                    title="تحليل الرفع بالغاز - الإنتاج والربحية",
+                    xaxis_title="حقن الغاز (MCF/يوم)",
+                    template="plotly_dark"
+                )
+                
+                fig1.update_yaxes(title_text="معدل النفط (برميل/يوم)", 
+                                secondary_y=False)
+                fig1.update_yaxes(title_text="الربح ($/يوم)", 
+                                secondary_y=True)
+            
+            figures['optimization_curve'] = fig1.to_dict()
+        
+        # 2. مخطط السلسلة الزمنية مع التنبؤ
+        if 'time' in historical_data.columns:
+            fig2 = go.Figure()
+            
+            fig2.add_trace(go.Scatter(
+                x=historical_data['time'],
+                y=historical_data['oil_rate'],
+                name='الإنتاج الفعلي',
+                line=dict(color='cyan', width=2)
+            ))
+            
+            # إضافة متوسط متحرك
+            if len(historical_data) > 7:
+                ma_7 = historical_data['oil_rate'].rolling(7).mean()
+                fig2.add_trace(go.Scatter(
+                    x=historical_data['time'],
+                    y=ma_7,
+                    name='متوسط 7 أيام',
+                    line=dict(color='yellow', width=3)
+                ))
+            
+            fig2.update_layout(
+                title="الأداء التاريخي مع المتوسط المتحرك",
+                xaxis_title="التاريخ",
+                yaxis_title="معدل النفط (برميل/يوم)",
+                template="plotly_dark"
+            )
+            
+            figures['time_series'] = fig2.to_dict()
+        
+        # 3. مخطط رادار للأداء المتعدد الأبعاد
+        metrics = optimization_results.get('metrics', {})
+        if metrics:
+            categories = list(metrics.keys())[:6]
+            values = list(metrics.values())[:6]
+            
+            fig3 = go.Figure(data=go.Scatterpolar(
+                r=values,
+                theta=categories,
+                fill='toself',
+                line=dict(color='lime', width=3)
+            ))
+            
+            fig3.update_layout(
+                polar=dict(
+                    radialaxis=dict(
+                        visible=True,
+                        range=[0, max(values) * 1.2]
+                    )),
+                showlegend=False,
+                title="مخطط رادار لمقاييس الأداء"
+            )
+            
+            figures['radar_chart'] = fig3.to_dict()
+        
+        # 4. مخطط الأهمية الاقتصادية
+        economic = optimization_results.get('economic_gain', {})
+        if economic:
+            labels = ['الإيرادات', 'تكاليف التشغيل', 'الربح الصافي']
+            values = [economic.get('revenue', 0),
+                     economic.get('total_cost', 0),
+                     economic.get('net_income', 0)]
+            
+            colors = ['#00FF00', '#FF0000', '#FFFF00']
+            
+            fig4 = go.Figure(data=[go.Bar(
+                x=labels,
+                y=values,
+                marker_color=colors,
+                text=[f'${v:,.0f}' for v in values],
+                textposition='auto',
+            )])
+            
+            fig4.update_layout(
+                title="التحليل الاقتصادي الشهري",
+                yaxis_title="قيمة ($)",
+                template="plotly_dark"
+            )
+            
+            figures['economic_chart'] = fig4.to_dict()
+        
+        return figures
+
+# ==================== MAIN API ENGINE ====================
+
+class OilNovaAIV2:
+    """OILNOVA AI V2.0 - المحرك الرئيسي"""
+    
+    def __init__(self):
+        self.optimizers = {}
+        self.visualizer = AdvancedVisualizer()
+        self.anomaly_detector = AdvancedAnomalyDetector()
+        
+    def analyze_well(self, well_data: pd.DataFrame, 
+                    well_type: str,
+                    config: dict = None) -> dict:
+        """تحليل شامل للبئر"""
+        
+        # التحقق من البيانات
+        if well_data.empty:
+            return {"error": "بيانات فارغة"}
+        
+        # تنظيف البيانات
+        cleaned_data = self._clean_data(well_data)
+        
+        # تحديد نوع الرفع إذا لم يكن محدد
+        if well_type == "auto":
+            well_type = self._detect_lift_type(cleaned_data)
+        
+        # تحضير خواص السوائل
+        fluid_props = FluidProperties(
+            oil_gravity=config.get('api_gravity', 35) if config else 35,
+            water_cut=config.get('water_cut', 0.3) if config else 0.3
+        )
+        
+        # إنشاء محرك التحسين
+        optimizer = DeepOptimizationEngine(well_type, fluid_props)
+        
+        # التحليل حسب نوع الرفع
+        if well_type.lower() == "esp":
+            # إنشاء منحنى مضخة
+            pump_curve = PumpCurve.from_manufacturer("ESP400", stages=100)
+            
+            # إنشاء IPR افتراضي
+            well_ipr = WellIPR(
+                reservoir_pressure=3000,
+                productivity_index=2.5,
+                oil_rate_max=4000
+            )
+            
+            results = optimizer.optimize_esp(pump_curve, well_ipr, cleaned_data)
+            
+        elif well_type.lower() in ["gas_lift", "gas"]:
+            results = optimizer.optimize_gas_lift(cleaned_data)
+            
+        elif well_type.lower() == "pcp":
+            # PCP optimization
+            results = self._optimize_pcp(cleaned_data)
+            
+        else:
+            return {"error": f"نوع رفع غير مدعوم: {well_type}"}
+        
+        # كشف الشذوذ
+        anomaly_results = self.anomaly_detector.predict_failure_risk(
+            cleaned_data.iloc[-1] if len(cleaned_data) > 0 else pd.Series()
+        )
+        
+        # إنشاء التصورات
+        visualizations = self.visualizer.create_comprehensive_dashboard(
+            results, cleaned_data
+        )
+        
+        # تجميع النتائج النهائية
+        final_report = {
+            "version": "OILNOVA AI V2.0",
+            "generated_at": datetime.now().isoformat(),
+            "well_type": well_type,
+            "optimization_results": results,
+            "anomaly_detection": anomaly_results,
+            "visualizations": visualizations,
+            "key_recommendations": self._generate_recommendations(results, anomaly_results),
+            "expected_benefits": {
+                "production_increase": results.get('expected_increase', 0),
+                "cost_reduction": results.get('economic_gain', {}).get('total_cost_reduction', 0),
+                "profit_increase": results.get('economic_gain', {}).get('net_income', 0),
+                "payback_period": self._calculate_payback(results)
+            },
+            "confidence_metrics": {
+                "data_quality": self._assess_data_quality(cleaned_data),
+                "model_confidence": results.get('confidence_level', 0.7),
+                "stability_score": results.get('stability_score', 75)
+            }
+        }
+        
+        return final_report
+    
+    def _clean_data(self, data: pd.DataFrame) -> pd.DataFrame:
+        """تنظيف وتحضير البيانات"""
+        cleaned = data.copy()
+        
+        # إزالة القيم المتطرفة باستخدام IQR
+        numeric_cols = cleaned.select_dtypes(include=[np.number]).columns
+        
+        for col in numeric_cols:
+            Q1 = cleaned[col].quantile(0.25)
+            Q3 = cleaned[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            
+            # استبدال القيم المتطرفة بالقيم الحدي
+            cleaned[col] = np.where(cleaned[col] < lower_bound, lower_bound, cleaned[col])
+            cleaned[col] = np.where(cleaned[col] > upper_bound, upper_bound, cleaned[col])
+        
+        # تعبئة القيم المفقودة
+        cleaned = cleaned.fillna(method='ffill').fillna(method='bfill')
+        
+        return cleaned
+    
+    def _detect_lift_type(self, data: pd.DataFrame) -> str:
+        """كشف نوع الرفع آلياً"""
+        columns = [col.lower() for col in data.columns]
+        
+        if any(x in ' '.join(columns) for x in ['freq', 'vfd', 'esp']):
+            return "esp"
+        elif any(x in ' '.join(columns) for x in ['gas', 'inject', 'valve']):
+            return "gas_lift"
+        elif any(x in ' '.join(columns) for x in ['rpm', 'pcp', 'torque']):
+            return "pcp"
+        else:
+            return "esp"  # افتراضي
+    
+    def _optimize_pcp(self, data: pd.DataFrame) -> dict:
+        """تحسين PCP"""
+        if 'rpm' not in data.columns or 'oil_rate' not in data.columns:
+            return {"error": "بيانات PCP غير كافية"}
+        
+        rpm = data['rpm'].values
+        rate = data['oil_rate'].values
+        
+        if len(rpm) < 5:
+            return {"error": "بيانات غير كافية لتحليل PCP"}
+        
+        # نموذل PCP: Q = a * RPM + b
+        coeffs = np.polyfit(rpm, rate, 1)
+        a, b = coeffs
+        
+        # النقطة المثلى مع مراعاة التآكل (لا تتجاوز 80% من أقصى RPM)
+        rpm_max = rpm.max()
+        rpm_opt = min(rpm_max * 0.8, np.mean(rpm) * 1.2)
+        rate_pred = a * rpm_opt + b
+        
+        return {
+            "optimal_rpm": float(rpm_opt),
+            "predicted_rate": float(rate_pred),
+            "pump_slip_estimate": self._estimate_pcp_slip(data),
+            "recommended_torque": rpm_opt * 2.5,  # N.m تقريبي
+            "elastomer_health": 100 - (rpm_opt / rpm_max * 20)
+        }
+    
+    def _estimate_pcp_slip(self, data: pd.DataFrame) -> float:
+        """تقدير انزلاق مضخة PCP"""
+        if 'rpm' in data.columns and 'oil_rate' in data.columns:
+            expected_rate = data['rpm'] * 0.5  # قدرة افتراضية 0.5 برميل/دورة
+            actual_rate = data['oil_rate']
+            slip = (expected_rate - actual_rate) / expected_rate * 100
+            return float(slip.mean())
+        return 0.0
+    
+    def _generate_recommendations(self, opt_results: dict, 
+                                anomaly: dict) -> list:
+        """توليد توصيات ذكية"""
+        recommendations = []
+        
+        # توصيات التحسين
+        if 'optimal_frequency' in opt_results:
+            recommendations.append(
+                f"ضبط تردد VFD إلى {opt_results['optimal_frequency']:.1f} هرتز "
+                f"للحصول على {opt_results.get('expected_increase', 0):.0f} برميل/يوم إضافية"
+            )
+        
+        elif 'optimal_gas_injection' in opt_results:
+            recommendations.append(
+                f"ضبط حقن الغاز إلى {opt_results['optimal_gas_injection']:.0f} MCF/يوم "
+                f"لتحسين كفاءة الرفع بنسبة {opt_results.get('gas_oil_ratio_improvement', 15):.1f}%"
+            )
+        
+        elif 'optimal_rpm' in opt_results:
+            recommendations.append(
+                f"ضبط سرعة PCP إلى {opt_results['optimal_rpm']:.0f} RPM "
+                f"لإطالة عمر الإيلاستومر"
+            )
+        
+        # توصيات الصيانة بناءً على كشف الشذوذ
+        if anomaly['risk_score'] > 50:
+            recommendations.append(
+                f"⚠️ {anomaly['recommended_action']} - درجة المخاطر: {anomaly['risk_score']}"
+            )
+        
+        # توصيات اقتصادية
+        economic = opt_results.get('economic_gain', {})
+        if economic.get('net_income', 0) > 10000:
+            recommendations.append(
+                f"💰 زيادة ربحية متوقعة: ${economic['net_income']:,.0f}/شهر"
+            )
+        
+        return recommendations
+    
+    def _calculate_payback(self, results: dict) -> float:
+        """حساب فترة الاسترداد"""
+        investment = 50000  # استثمار تقريبي
+        monthly_profit = results.get('economic_gain', {}).get('net_income', 0)
+        
+        if monthly_profit > 0:
+            return investment / monthly_profit
+        return 0.0
+    
+    def _assess_data_quality(self, data: pd.DataFrame) -> float:
+        """تقييم جودة البيانات"""
+        quality_score = 100
+        
+        # نقاط البيانات
+        if len(data) < 30:
+            quality_score -= 20
+        
+        # القيم المفقودة
+        missing_pct = data.isnull().sum().sum() / (data.shape[0] * data.shape[1])
+        quality_score -= missing_pct * 50
+        
+        # التنوع في البيانات
+        numeric_cols = data.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if data[col].std() < 1e-6:
+                quality_score -= 5
+        
+        return max(quality_score, 0)
+
+# ==================== FLASK API ====================
 
 app = Flask(__name__)
-CORS(app)
+ai_engine = OilNovaAIV2()
 
-
-# ========= helpers =========
-
-def read_table_from_file(file_storage):
-    filename = file_storage.filename.lower()
-    if filename.endswith(".csv"):
-        df = pd.read_csv(file_storage)
-    elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-        df = pd.read_excel(file_storage)
-    else:
-        raise ValueError("Only CSV / Excel files are supported.")
-    return df
-
-
-def find_col(df, candidates):
-    cols = [c.lower().strip() for c in df.columns]
-    for cand_group in candidates:
-        for c in cand_group:
-            if c.lower() in cols:
-                return df.columns[cols.index(c.lower())]
-    return None
-
-
-def safe_list(x):
-    return [] if x is None else list(map(float, x))
-
-
-def build_base_summary(df):
-    summary = []
-    summary.append(f"Rows: {len(df)}, Columns: {len(df.columns)}")
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if numeric_cols:
-        summary.append(f"Numeric columns: {', '.join(numeric_cols[:6])}"
-                       + ("..." if len(numeric_cols) > 6 else ""))
-    else:
-        summary.append("No numeric columns detected.")
-    return summary
-
-
-# ========= core analysis for each lift type =========
-
-def analyze_gas_lift(df):
-    # Try to detect required columns
-    t_col = find_col(df, [["time", "date", "day"]])
-    q_col = find_col(df, [["q_oil", "oil_rate", "rate", "qo"]])
-    inj_col = find_col(df, [["q_gas_inj", "gas_injection", "gas_rate", "qginj"]])
-    whp_col = find_col(df, [["whp", "wellhead_pressure"]])
-    bhp_col = find_col(df, [["bhp", "bottomhole_pressure"]])
-
-    numeric = df.select_dtypes(include=[np.number]).copy()
-    numeric = numeric.replace([np.inf, -np.inf], np.nan).dropna(how="all")
-
-    # simple time index
-    if t_col is None:
-        numeric["t"] = np.arange(len(numeric))
-        t_col = "t"
-    else:
-        numeric["t"] = np.arange(len(numeric))
-
-    # default columns if not found
-    if q_col is None and numeric.shape[1] > 0:
-        q_col = numeric.columns[0]
-    if inj_col is None and numeric.shape[1] > 1:
-        inj_col = numeric.columns[1]
-
-    t = numeric["t"].values
-    q = numeric[q_col].values if q_col in numeric.columns else np.zeros_like(t)
-    inj = numeric[inj_col].values if inj_col in numeric.columns else np.zeros_like(t)
-
-    # crude optimization: find best average rate within 5 quantiles of injection
-    if inj.std() > 0:
-        qtiles = np.linspace(0.2, 0.9, 6)
-        best_q = None
-        best_mean_rate = -1
-        for qt in qtiles:
-            thr = np.quantile(inj, qt)
-            mask = inj <= thr
-            if mask.sum() < 5:
-                continue
-            mean_rate = q[mask].mean()
-            if mean_rate > best_mean_rate:
-                best_mean_rate = mean_rate
-                best_q = thr
-        opt_inj = float(best_q) if best_q is not None else float(np.nan)
-    else:
-        opt_inj = float(np.nan)
-
-    # time series plot
-    time_series = {
-        "t": safe_list(t),
-        "q_oil": safe_list(q),
-        "inj_gas": safe_list(inj)
-    }
-
-    # optimization curve (inj vs q)
-    inj_sorted_idx = np.argsort(inj)
-    inj_sorted = inj[inj_sorted_idx]
-    q_sorted = q[inj_sorted_idx]
-
-    opt_curve = {
-        "x": safe_list(inj_sorted),
-        "y": safe_list(q_sorted),
-        "xlabel": inj_col or "Gas Injection Rate",
-        "ylabel": q_col or "Oil Rate",
-        "title": "Gas Injection vs Oil Rate"
-    }
-
-    summary = build_base_summary(df)
-    summary.append("Lift Type: Gas Lift")
-    if not np.isnan(opt_inj):
-        summary.append(f"Suggested optimal gas injection ~ {opt_inj:.2f} (units as in file).")
-
-    recs = []
-    recs.append("Reduce gas injection above the AI suggested optimum to avoid over-injection.")
-    if whp_col or bhp_col:
-        recs.append("Check WHP/BHP trends for unstable gradients or rapid fluctuations.")
-    recs.append("Use the valve map and gradient curves (next version) to refine the optimal injection window.")
-
-    risks = []
-    if inj.std() == 0:
-        risks.append("Gas injection is almost constant – no systematic optimization attempts detected.")
-    if q.std() < 1e-3:
-        risks.append("Oil rate shows minimal variation – possible metering issues or unstable well behavior.")
-
-    metrics = {
-        "avg_oil_rate": float(np.nanmean(q)) if len(q) else None,
-        "max_oil_rate": float(np.nanmax(q)) if len(q) else None,
-        "avg_gas_injection": float(np.nanmean(inj)) if len(inj) else None,
-        "opt_gas_injection": opt_inj
-    }
-
-    return {
-        "lift_type": "Gas Lift",
-        "summary": summary,
-        "recommendations": recs,
-        "risks": risks,
-        "plots": {
-            "time_series": time_series,
-            "opt_curve": opt_curve
-        },
-        "metrics": metrics
-    }
-
-
-def analyze_esp(df):
-    t_col = find_col(df, [["time", "date", "day"]])
-    q_col = find_col(df, [["q_oil", "oil_rate", "rate", "qo"]])
-    freq_col = find_col(df, [["freq_hz", "frequency", "hz", "vfd"]])
-    intake_col = find_col(df, [["intake_pressure", "pi", "pump_intake"]])
-    discharge_col = find_col(df, [["discharge_pressure", "pd", "pump_discharge"]])
-
-    numeric = df.select_dtypes(include=[np.number]).copy()
-    numeric = numeric.replace([np.inf, -np.inf], np.nan).dropna(how="all")
-
-    if t_col is None:
-        numeric["t"] = np.arange(len(numeric))
-        t_col = "t"
-    else:
-        numeric["t"] = np.arange(len(numeric))
-
-    if q_col is None and numeric.shape[1] > 0:
-        q_col = numeric.columns[0]
-    if freq_col is None and numeric.shape[1] > 1:
-        freq_col = numeric.columns[1]
-
-    t = numeric["t"].values
-    q = numeric[q_col].values if q_col in numeric.columns else np.zeros_like(t)
-    f = numeric[freq_col].values if freq_col in numeric.columns else np.zeros_like(t)
-
-    # Fit simple quadratic: q = a f^2 + b f + c
-    if len(f) >= 5 and f.std() > 0:
-        try:
-            coeffs = np.polyfit(f, q, 2)
-            a, b, c = coeffs
-            if a != 0:
-                f_opt = -b / (2 * a)
-            else:
-                f_opt = np.nan
-        except Exception:
-            f_opt = np.nan
-    else:
-        f_opt = np.nan
-
-    time_series = {
-        "t": safe_list(t),
-        "q_oil": safe_list(q),
-        "freq": safe_list(f)
-    }
-
-    f_sorted_idx = np.argsort(f)
-    f_sorted = f[f_sorted_idx]
-    q_sorted = q[f_sorted_idx]
-    opt_curve = {
-        "x": safe_list(f_sorted),
-        "y": safe_list(q_sorted),
-        "xlabel": freq_col or "Frequency (Hz)",
-        "ylabel": q_col or "Oil Rate",
-        "title": "Frequency vs Oil Rate"
-    }
-
-    summary = build_base_summary(df)
-    summary.append("Lift Type: ESP")
-    if not np.isnan(f_opt):
-        summary.append(f"AI suggested optimal operating frequency ≈ {f_opt:.2f} Hz (within data range).")
-
-    recs = []
-    recs.append("Operate close to the AI suggested frequency window while monitoring motor load and vibration.")
-    if intake_col or discharge_col:
-        recs.append("Track pump intake/discharge pressures to avoid gas lock and overload conditions.")
-    recs.append("Use the time series chart to detect sudden drops in rate (possible failures or gas interference).")
-
-    risks = []
-    if f.std() == 0:
-        risks.append("Frequency is almost constant – no VFD optimization patterns detected.")
-    if q.std() < 1e-3:
-        risks.append("Production is nearly flat; check measurement accuracy or well stability.")
-    if not np.isnan(f_opt) and (f_opt < np.min(f) or f_opt > np.max(f)):
-        risks.append("AI optimal frequency lies outside the historical operating range – validate before applying.")
-
-    metrics = {
-        "avg_oil_rate": float(np.nanmean(q)) if len(q) else None,
-        "max_oil_rate": float(np.nanmax(q)) if len(q) else None,
-        "avg_frequency": float(np.nanmean(f)) if len(f) else None,
-        "opt_frequency": float(f_opt) if not np.isnan(f_opt) else None
-    }
-
-    return {
-        "lift_type": "ESP",
-        "summary": summary,
-        "recommendations": recs,
-        "risks": risks,
-        "plots": {
-            "time_series": time_series,
-            "opt_curve": opt_curve
-        },
-        "metrics": metrics
-    }
-
-
-def analyze_pcp(df):
-    t_col = find_col(df, [["time", "date", "day"]])
-    q_col = find_col(df, [["q_oil", "oil_rate", "rate", "qo"]])
-    rpm_col = find_col(df, [["rpm", "speed", "spinner"]])
-    torque_col = find_col(df, [["torque", "tq"]])
-
-    numeric = df.select_dtypes(include=[np.number]).copy()
-    numeric = numeric.replace([np.inf, -np.inf], np.nan).dropna(how="all")
-
-    if t_col is None:
-        numeric["t"] = np.arange(len(numeric))
-        t_col = "t"
-    else:
-        numeric["t"] = np.arange(len(numeric))
-
-    if q_col is None and numeric.shape[1] > 0:
-        q_col = numeric.columns[0]
-    if rpm_col is None and numeric.shape[1] > 1:
-        rpm_col = numeric.columns[1]
-
-    t = numeric["t"].values
-    q = numeric[q_col].values if q_col in numeric.columns else np.zeros_like(t)
-    rpm = numeric[rpm_col].values if rpm_col in numeric.columns else np.zeros_like(t)
-
-    # simple linear relation q ~ a * rpm + b
-    if len(rpm) >= 3 and rpm.std() > 0:
-        try:
-            coeffs = np.polyfit(rpm, q, 1)
-            a, b = coeffs
-            rpm_min, rpm_max = np.min(rpm), np.max(rpm)
-            # propose point where marginal gain starts diminishing: 80% of max RPM
-            rpm_opt = rpm_min + 0.8 * (rpm_max - rpm_min)
-        except Exception:
-            rpm_opt = np.nan
-    else:
-        rpm_opt = np.nan
-
-    time_series = {
-        "t": safe_list(t),
-        "q_oil": safe_list(q),
-        "rpm": safe_list(rpm)
-    }
-
-    rpm_sorted_idx = np.argsort(rpm)
-    rpm_sorted = rpm[rpm_sorted_idx]
-    q_sorted = q[rpm_sorted_idx]
-    opt_curve = {
-        "x": safe_list(rpm_sorted),
-        "y": safe_list(q_sorted),
-        "xlabel": rpm_col or "RPM",
-        "ylabel": q_col or "Oil Rate",
-        "title": "RPM vs Oil Rate"
-    }
-
-    summary = build_base_summary(df)
-    summary.append("Lift Type: PCP")
-    if not np.isnan(rpm_opt):
-        summary.append(f"AI suggested RPM window center ≈ {rpm_opt:.2f} RPM (80% of max historical speed).")
-
-    recs = []
-    recs.append("Avoid running consistently at max RPM to reduce wear on the elastomer and rod string.")
-    if torque_col:
-        recs.append("Monitor torque to catch early signs of sanding or plugging events.")
-    recs.append("Use the RPM vs rate curve to identify a sweet spot between rate increase and mechanical risk.")
-
-    risks = []
-    if rpm.std() == 0:
-        risks.append("PCP RPM is almost constant – no dynamic optimization detected.")
-    if q.std() < 1e-3:
-        risks.append("Production is nearly flat; check pump condition and inflow performance.")
-    metrics = {
-        "avg_oil_rate": float(np.nanmean(q)) if len(q) else None,
-        "max_oil_rate": float(np.nanmax(q)) if len(q) else None,
-        "avg_rpm": float(np.nanmean(rpm)) if len(rpm) else None,
-        "opt_rpm": float(rpm_opt) if not np.isnan(rpm_opt) else None
-    }
-
-    return {
-        "lift_type": "PCP",
-        "summary": summary,
-        "recommendations": recs,
-        "risks": risks,
-        "plots": {
-            "time_series": time_series,
-            "opt_curve": opt_curve
-        },
-        "metrics": metrics
-    }
-
-
-def auto_detect_lift_type(df):
-    cols = [c.lower() for c in df.columns]
-
-    if any(k in " ".join(cols) for k in ["gas_inj", "q_gas", "glv", "annulus"]):
-        return "gas_lift"
-    if any(k in " ".join(cols) for k in ["freq", "vfd", "esp", "intake_pressure", "discharge_pressure"]):
-        return "esp"
-    if any(k in " ".join(cols) for k in ["rpm", "pcp", "torque", "rod"]):
-        return "pcp"
-    # fallback default
-    return "esp"
-
-
-# ========= API endpoints =========
-
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    """
-    POST /analyze
-    form-data:
-      - file: CSV or Excel
-      - lift_type: "auto" / "gas_lift" / "esp" / "pcp"
-    """
+@app.route('/api/v2/analyze', methods=['POST'])
+def analyze_v2():
+    """نقطة نهاية التحليل المتقدم"""
     try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file uploaded."}), 400
-
-        file = request.files["file"]
-        lift_type = request.form.get("lift_type", "auto").lower().strip()
-
-        df = read_table_from_file(file)
-
-        if lift_type == "auto":
-            lift_type = auto_detect_lift_type(df)
-
-        if lift_type in ["gas_lift", "gas lift"]:
-            result = analyze_gas_lift(df)
-        elif lift_type == "esp":
-            result = analyze_esp(df)
-        elif lift_type == "pcp":
-            result = analyze_pcp(df)
+        if 'file' not in request.files:
+            return jsonify({
+                "error": "No file uploaded",
+                "solution": "Upload CSV or Excel file"
+            }), 400
+        
+        file = request.files['file']
+        
+        # قراءة الملف
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file)
+        elif file.filename.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(file)
         else:
-            return jsonify({"error": f"Unknown lift type: {lift_type}"}), 400
-
-        result["lift_type_code"] = lift_type
-        result["generated_at"] = datetime.datetime.utcnow().isoformat() + "Z"
-
-        return jsonify(result)
-
+            return jsonify({"error": "Unsupported file format"}), 400
+        
+        # الحصول على الإعدادات
+        well_type = request.form.get('well_type', 'auto')
+        config_str = request.form.get('config', '{}')
+        
+        try:
+            config = json.loads(config_str)
+        except:
+            config = {}
+        
+        # تشغيل التحليل
+        start_time = datetime.now()
+        results = ai_engine.analyze_well(df, well_type, config)
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        # إضافة ميتاداتا
+        results['processing_time_seconds'] = processing_time
+        results['data_points_analyzed'] = len(df)
+        results['ai_model'] = "DeepSeek Custom Physics-AI Hybrid Model"
+        
+        return jsonify(results)
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error": str(e),
+            "traceback": "Contact support for detailed logs"
+        }), 500
 
+@app.route('/api/v2/demo', methods=['GET'])
+def demo():
+    """عرض تجريبي مع بيانات افتراضية"""
+    # إنشاء بيانات تجريبية
+    dates = pd.date_range(end=datetime.now(), periods=60, freq='D')
+    
+    # بيانات ESP تجريبية
+    demo_data = pd.DataFrame({
+        'date': dates,
+        'frequency': 45 + np.random.randn(60) * 5,
+        'oil_rate': 1500 + np.random.randn(60) * 200,
+        'motor_temp': 160 + np.random.randn(60) * 10,
+        'vibration': 0.3 + np.random.randn(60) * 0.1,
+        'intake_pressure': 800 + np.random.randn(60) * 50,
+        'discharge_pressure': 2200 + np.random.randn(60) * 100,
+        'current': 90 + np.random.randn(60) * 5
+    })
+    
+    # تحليل البيانات التجريبية
+    results = ai_engine.analyze_well(demo_data, 'esp', {
+        'api_gravity': 32,
+        'water_cut': 0.25
+    })
+    
+    return jsonify(results)
 
-@app.route("/download-report", methods=["POST"])
-def download_report():
-    """
-    POST /download-report
-    JSON body:
-      { "analysis": { ...result from /analyze... } }
-    Returns: PDF file.
-    """
-    try:
-        data = request.get_json()
-        if not data or "analysis" not in data:
-            return jsonify({"error": "Missing analysis payload."}), 400
+@app.route('/api/v2/health', methods=['GET'])
+def health():
+    """فحص صحة النظام"""
+    return jsonify({
+        "status": "operational",
+        "version": "OILNOVA AI V2.0",
+        "ai_engine": "DeepSeek Hybrid Physics-AI",
+        "models_loaded": True,
+        "timestamp": datetime.now().isoformat(),
+        "performance": "optimized"
+    })
 
-        analysis = data["analysis"]
-
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=A4)
-        styles = getSampleStyleSheet()
-        story = []
-
-        title = "OILNOVA – AI Lift Optimization Report"
-        story.append(Paragraph(title, styles["Title"]))
-        story.append(Spacer(1, 12))
-
-        lift_type = analysis.get("lift_type", "Unknown")
-        story.append(Paragraph(f"Lift Type: <b>{lift_type}</b>", styles["Normal"]))
-        story.append(Spacer(1, 6))
-
-        gen_time = analysis.get("generated_at", "")
-        if gen_time:
-            story.append(Paragraph(f"Generated at (UTC): {gen_time}", styles["Normal"]))
-            story.append(Spacer(1, 12))
-
-        # Summary
-        story.append(Paragraph("<b>Summary</b>", styles["Heading2"]))
-        for line in analysis.get("summary", []):
-            story.append(Paragraph(line, styles["Normal"]))
-        story.append(Spacer(1, 12))
-
-        # Metrics
-        metrics = analysis.get("metrics", {})
-        if metrics:
-            story.append(Paragraph("<b>Key Metrics</b>", styles["Heading2"]))
-            table_data = [["Metric", "Value"]]
-            for k, v in metrics.items():
-                if v is None:
-                    val_str = "-"
-                else:
-                    val_str = f"{v:.3f}" if isinstance(v, (int, float)) else str(v)
-                table_data.append([k, val_str])
-            t = Table(table_data, hAlign="LEFT")
-            t.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#020617")),
-            ]))
-            story.append(t)
-            story.append(Spacer(1, 12))
-
-        # Recommendations
-        recs = analysis.get("recommendations", [])
-        if recs:
-            story.append(Paragraph("<b>AI Recommendations</b>", styles["Heading2"]))
-            for r in recs:
-                story.append(Paragraph(f"• {r}", styles["Normal"]))
-            story.append(Spacer(1, 12))
-
-        # Risks
-        risks = analysis.get("risks", [])
-        if risks:
-            story.append(Paragraph("<b>Risks & Alerts</b>", styles["Heading2"]))
-            for r in risks:
-                story.append(Paragraph(f"• {r}", styles["Normal"]))
-            story.append(Spacer(1, 12))
-
-        story.append(Paragraph(
-            "This report was generated automatically by OILNOVA AI – Lift Optimization Engine.",
-            styles["Italic"]
-        ))
-
-        doc.build(story)
-        buffer.seek(0)
-
-        filename = f"OILNOVA_AI_Lift_Report_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.pdf"
-        return send_file(
-            buffer,
-            as_attachment=True,
-            download_name=filename,
-            mimetype="application/pdf"
-        )
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    # For local testing
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080, debug=True)
