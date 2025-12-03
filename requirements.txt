@@ -5,3 +5,5 @@ numpy
 reportlab
 openpyxl
 gunicorn
+scipy
+scikit-learn
