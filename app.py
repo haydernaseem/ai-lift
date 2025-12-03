@@ -24,9 +24,6 @@ from reportlab.graphics.shapes import Drawing, Line
 from reportlab.graphics.charts.lineplots import LinePlot
 from reportlab.graphics.charts.legends import Legend
 from reportlab.graphics import renderPDF
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
 
 app = Flask(__name__)
 CORS(app)
@@ -120,6 +117,22 @@ def calculate_productivity_index(q_oil, bhp, whp=None):
         return abs(slope)  # PI is positive
     except:
         return None
+
+
+def interp_optimal_production(analysis):
+    """Interpolate production at optimal point"""
+    plots = analysis.get("plots", {})
+    opt = plots.get("opt_curve", {})
+    
+    if opt.get('opt_point') and len(opt['opt_point']) == 2:
+        return opt['opt_point'][1]
+    
+    # Fallback calculation
+    metrics = analysis.get("metrics", {})
+    if metrics.get('avg_oil_rate'):
+        return metrics['avg_oil_rate'] * 1.1  # 10% improvement estimate
+    
+    return 0
 
 
 def analyze_gas_lift_advanced(df):
@@ -299,6 +312,14 @@ def analyze_gas_lift_advanced(df):
     else:
         q_smooth_curve = q_sorted
     
+    # Calculate optimal production
+    if not np.isnan(opt_inj_final) and len(inj_sorted) > 0 and len(q_smooth_curve) > 0:
+        opt_production = float(np.interp(opt_inj_final, inj_sorted, q_smooth_curve))
+        opt_point = [float(opt_inj_final), opt_production]
+    else:
+        opt_production = None
+        opt_point = None
+    
     opt_curve = {
         "x": safe_list(inj_sorted),
         "y": safe_list(q_sorted),
@@ -306,8 +327,7 @@ def analyze_gas_lift_advanced(df):
         "xlabel": inj_col or "Gas Injection Rate",
         "ylabel": q_col or "Oil Rate",
         "title": "Gas Injection vs Oil Rate",
-        "opt_point": [float(opt_inj_final), float(np.interp(opt_inj_final, inj_sorted, q_smooth_curve))] 
-        if not np.isnan(opt_inj_final) else None
+        "opt_point": opt_point
     }
     
     # Enhanced summary
@@ -316,7 +336,8 @@ def analyze_gas_lift_advanced(df):
     
     if not np.isnan(opt_inj_final):
         summary.append(f"<b>AI Optimal Gas Injection:</b> {opt_inj_final:.2f} units")
-        summary.append(f"<b>Expected Oil Rate at Optimum:</b> {np.interp(opt_inj_final, inj_sorted, q_smooth_curve):.2f} units")
+        if opt_production:
+            summary.append(f"<b>Expected Oil Rate at Optimum:</b> {opt_production:.2f} units")
     
     if pi is not None:
         summary.append(f"<b>Productivity Index (PI):</b> {pi:.4f} units/psi")
@@ -327,16 +348,22 @@ def analyze_gas_lift_advanced(df):
         current_avg_inj = np.mean(inj_clean)
         current_efficiency = current_avg_q / current_avg_inj if current_avg_inj > 0 else 0
         
-        opt_efficiency = np.interp(opt_inj_final, inj_sorted, q_smooth_curve) / opt_inj_final \
-                        if opt_inj_final > 0 else 0
+        if opt_inj_final and not np.isnan(opt_inj_final) and opt_production:
+            opt_efficiency = opt_production / opt_inj_final if opt_inj_final > 0 else 0
+        else:
+            opt_efficiency = 0
         
         summary.append(f"<b>Current Efficiency (q/inj):</b> {current_efficiency:.4f}")
         summary.append(f"<b>Optimal Efficiency (q/inj):</b> {opt_efficiency:.4f}")
-        summary.append(f"<b>Potential Improvement:</b> {(opt_efficiency/current_efficiency - 1)*100:.1f}%")
+        if current_efficiency > 0:
+            summary.append(f"<b>Potential Improvement:</b> {(opt_efficiency/current_efficiency - 1)*100:.1f}%")
     
     # Enhanced recommendations
     recs = []
-    recs.append(f"<b>Adjust gas injection to ~{opt_inj_final:.2f} units</b> for optimal production")
+    if not np.isnan(opt_inj_final):
+        recs.append(f"<b>Adjust gas injection to ~{opt_inj_final:.2f} units</b> for optimal production")
+    else:
+        recs.append("<b>Optimize gas injection rate</b> based on production response")
     
     if pi is not None and pi < 0.5:
         recs.append("<b>Consider well stimulation</b> - Low PI indicates possible formation damage")
@@ -385,8 +412,10 @@ def analyze_gas_lift_advanced(df):
         "opt_gas_injection": float(opt_inj_final) if not np.isnan(opt_inj_final) else None,
         "current_efficiency": float(current_efficiency) if 'current_efficiency' in locals() else None,
         "optimal_efficiency": float(opt_efficiency) if 'opt_efficiency' in locals() else None,
+        "optimal_production": float(opt_production) if opt_production else None,
         "productivity_index": float(pi) if pi is not None else None,
-        "data_quality_score": float(valid_mask.sum() / len(t)) if len(t) > 0 else None
+        "data_quality_score": float(valid_mask.sum() / len(t)) if len(t) > 0 else None,
+        "data_points": len(q_clean)
     }
     
     return {
@@ -589,6 +618,14 @@ def analyze_esp_advanced(df):
     else:
         q_smooth_curve = q_sorted
     
+    # Calculate optimal production
+    if not np.isnan(opt_freq_final) and len(f_sorted) > 0 and len(q_smooth_curve) > 0:
+        opt_production = float(np.interp(opt_freq_final, f_sorted, q_smooth_curve))
+        opt_point = [float(opt_freq_final), opt_production]
+    else:
+        opt_production = None
+        opt_point = None
+    
     opt_curve = {
         "x": safe_list(f_sorted),
         "y": safe_list(q_sorted),
@@ -596,8 +633,7 @@ def analyze_esp_advanced(df):
         "xlabel": freq_col or "Frequency (Hz)",
         "ylabel": q_col or "Oil Rate",
         "title": "Frequency vs Oil Rate",
-        "opt_point": [float(opt_freq_final), float(np.interp(opt_freq_final, f_sorted, q_smooth_curve))] 
-        if not np.isnan(opt_freq_final) else None
+        "opt_point": opt_point
     }
     
     # Enhanced summary
@@ -613,6 +649,7 @@ def analyze_esp_advanced(df):
             summary.append(f"<b>Recommended frequency change:</b> {freq_change:+.1f}%")
     
     # Calculate system efficiency if possible
+    system_efficiency = None
     if not np.all(np.isnan(intake)) and not np.all(np.isnan(discharge)) and not np.all(np.isnan(current)):
         try:
             head = discharge[valid_mask] - intake[valid_mask]
@@ -625,7 +662,10 @@ def analyze_esp_advanced(df):
     
     # Enhanced recommendations
     recs = []
-    recs.append(f"<b>Adjust VFD frequency to ~{opt_freq_final:.2f} Hz</b> for optimal production")
+    if not np.isnan(opt_freq_final):
+        recs.append(f"<b>Adjust VFD frequency to ~{opt_freq_final:.2f} Hz</b> for optimal production")
+    else:
+        recs.append("<b>Optimize VFD frequency</b> based on production response")
     
     if not np.all(np.isnan(intake)):
         intake_avg = np.nanmean(intake[valid_mask])
@@ -654,7 +694,7 @@ def analyze_esp_advanced(df):
     if not np.all(np.isnan(intake)) and not np.all(np.isnan(discharge)) and opt_freq_final is not None:
         try:
             head = np.nanmean(discharge[valid_mask] - intake[valid_mask])
-            q_opt = np.interp(opt_freq_final, f_sorted, q_smooth_curve)
+            q_opt = np.interp(opt_freq_final, f_sorted, q_smooth_curve) if opt_production else np.mean(q_clean)
             
             # Simplified specific speed calculation
             Ns = opt_freq_final * np.sqrt(q_opt) / (head ** 0.75)
@@ -671,6 +711,7 @@ def analyze_esp_advanced(df):
         "opt_frequency": float(opt_freq_final) if not np.isnan(opt_freq_final) else None,
         "frequency_std": float(np.nanstd(f_clean)) if len(f_clean) > 0 else None,
         "current_oil_rate": float(q_clean[-1]) if len(q_clean) > 0 else None,
+        "optimal_production": float(opt_production) if opt_production else None,
         "frequency_range": f"[{float(np.min(f_clean)) if len(f_clean)>0 else 0}, "
                           f"{float(np.max(f_clean)) if len(f_clean)>0 else 0}]",
         "data_points": len(q_clean)
@@ -681,6 +722,9 @@ def analyze_esp_advanced(df):
     
     if not np.all(np.isnan(discharge)):
         metrics["avg_discharge_pressure"] = float(np.nanmean(discharge[valid_mask]))
+    
+    if system_efficiency is not None:
+        metrics["system_efficiency"] = float(system_efficiency)
     
     return {
         "lift_type": "ESP",
@@ -878,6 +922,14 @@ def analyze_pcp_advanced(df):
     else:
         q_smooth_curve = q_sorted
     
+    # Calculate optimal production
+    if not np.isnan(opt_rpm_final) and len(rpm_sorted) > 0 and len(q_smooth_curve) > 0:
+        opt_production = float(np.interp(opt_rpm_final, rpm_sorted, q_smooth_curve))
+        opt_point = [float(opt_rpm_final), opt_production]
+    else:
+        opt_production = None
+        opt_point = None
+    
     opt_curve = {
         "x": safe_list(rpm_sorted),
         "y": safe_list(q_sorted),
@@ -885,8 +937,7 @@ def analyze_pcp_advanced(df):
         "xlabel": rpm_col or "RPM",
         "ylabel": q_col or "Oil Rate",
         "title": "RPM vs Oil Rate",
-        "opt_point": [float(opt_rpm_final), float(np.interp(opt_rpm_final, rpm_sorted, q_smooth_curve))] 
-        if not np.isnan(opt_rpm_final) else None
+        "opt_point": opt_point
     }
     
     # Enhanced summary
@@ -902,6 +953,8 @@ def analyze_pcp_advanced(df):
             summary.append(f"<b>Recommended RPM change:</b> {rpm_change:+.1f}%")
     
     # Calculate elastomer stress if torque available
+    max_stress = None
+    avg_stress = None
     if torque_clean is not None and not np.all(np.isnan(torque_clean)):
         try:
             stress = torque_clean[valid_mask] / (np.pi * (2.5 ** 3) / 16)  # Simplified stress calculation
@@ -918,7 +971,10 @@ def analyze_pcp_advanced(df):
     
     # Enhanced recommendations
     recs = []
-    recs.append(f"<b>Adjust RPM to ~{opt_rpm_final:.2f}</b> for optimal production and reduced wear")
+    if not np.isnan(opt_rpm_final):
+        recs.append(f"<b>Adjust RPM to ~{opt_rpm_final:.2f}</b> for optimal production and reduced wear")
+    else:
+        recs.append("<b>Optimize RPM</b> based on production response")
     
     if torque_clean is not None:
         torque_cv = np.nanstd(torque_clean[valid_mask]) / np.nanmean(torque_clean[valid_mask])
@@ -944,6 +1000,7 @@ def analyze_pcp_advanced(df):
             risks.append("<b>High torque events detected</b> - Risk of rod failure or pump seizure")
     
     # Calculate wear rate
+    wear_rate = None
     if len(rpm_clean) > 10 and torque_clean is not None:
         try:
             # Simplified wear calculation
@@ -961,6 +1018,7 @@ def analyze_pcp_advanced(df):
         "opt_rpm": float(opt_rpm_final) if not np.isnan(opt_rpm_final) else None,
         "rpm_std": float(np.nanstd(rpm_clean)) if len(rpm_clean) > 0 else None,
         "current_production": float(q_clean[-1]) if len(q_clean) > 0 else None,
+        "optimal_production": float(opt_production) if opt_production else None,
         "rpm_range": f"[{float(np.min(rpm_clean)) if len(rpm_clean)>0 else 0}, "
                     f"{float(np.max(rpm_clean)) if len(rpm_clean)>0 else 0}]",
         "data_points": len(q_clean)
@@ -972,6 +1030,15 @@ def analyze_pcp_advanced(df):
     
     if pressure_col and not np.all(np.isnan(pressure)):
         metrics["avg_pressure"] = float(np.nanmean(pressure[valid_mask]))
+    
+    if max_stress is not None:
+        metrics["max_elastomer_stress"] = float(max_stress)
+    
+    if avg_stress is not None:
+        metrics["avg_elastomer_stress"] = float(avg_stress)
+    
+    if wear_rate is not None:
+        metrics["wear_rate"] = float(wear_rate)
     
     return {
         "lift_type": "PCP",
@@ -1060,25 +1127,6 @@ def create_professional_pdf(analysis):
         textColor=colors.HexColor('#2d3748')
     )
     
-    # Table header style
-    table_header_style = ParagraphStyle(
-        'TableHeader',
-        parent=styles['Normal'],
-        fontSize=9,
-        textColor=colors.white,
-        alignment=1,
-        fontName='Helvetica-Bold'
-    )
-    
-    # Table cell style
-    table_cell_style = ParagraphStyle(
-        'TableCell',
-        parent=styles['Normal'],
-        fontSize=9,
-        textColor=colors.HexColor('#2d3748'),
-        alignment=1
-    )
-    
     doc = SimpleDocTemplate(buffer, pagesize=A4, 
                           rightMargin=72, leftMargin=72,
                           topMargin=72, bottomMargin=72)
@@ -1134,19 +1182,33 @@ def create_professional_pdf(analysis):
     lift_type = analysis.get("lift_type", "Unknown")
     metrics = analysis.get("metrics", {})
     
-    key_findings_data = [
-        ["• <b>Best-fitting Lift Type:</b>", f"<b>{lift_type}</b>"],
-        ["• <b>AI Optimal Operating Point:</b>", 
-         f"{format_optimal_point(analysis, metrics)}"],
-        ["• <b>Data Points Analyzed:</b>", 
-         f"{metrics.get('data_points', 'N/A')} measurements"],
-        ["• <b>Data Quality Score:</b>", 
-         f"{(metrics.get('data_quality_score', 0) * 100):.1f}%"],
-        ["• <b>Current Average Production:</b>", 
-         f"{metrics.get('avg_oil_rate', 'N/A'):.2f} units/day"],
-        ["• <b>Maximum Historical Production:</b>", 
-         f"{metrics.get('max_oil_rate', 'N/A'):.2f} units/day"]
-    ]
+    key_findings_data = []
+    
+    # Best-fitting Lift Type
+    key_findings_data.append(["• <b>Best-fitting Lift Type:</b>", f"<b>{lift_type}</b>"])
+    
+    # AI Optimal Operating Point
+    optimal_point = format_optimal_point(analysis, metrics)
+    key_findings_data.append(["• <b>AI Optimal Operating Point:</b>", optimal_point])
+    
+    # Data Points Analyzed
+    data_points = metrics.get('data_points', 'N/A')
+    key_findings_data.append(["• <b>Data Points Analyzed:</b>", f"{data_points} measurements"])
+    
+    # Data Quality Score
+    data_quality = metrics.get('data_quality_score', 0)
+    if data_quality:
+        key_findings_data.append(["• <b>Data Quality Score:</b>", f"{(data_quality * 100):.1f}%"])
+    
+    # Current Average Production
+    avg_rate = metrics.get('avg_oil_rate')
+    if avg_rate:
+        key_findings_data.append(["• <b>Current Average Production:</b>", f"{avg_rate:.2f} units/day"])
+    
+    # Maximum Historical Production
+    max_rate = metrics.get('max_oil_rate')
+    if max_rate:
+        key_findings_data.append(["• <b>Maximum Historical Production:</b>", f"{max_rate:.2f} units/day"])
     
     findings_table = Table(key_findings_data, colWidths=[250, 150])
     findings_table.setStyle(TableStyle([
@@ -1197,70 +1259,130 @@ def create_professional_pdf(analysis):
         ["<b>PARAMETER</b>", "<b>CURRENT VALUE</b>", "<b>AI OPTIMAL VALUE</b>", "<b>UNIT</b>", "<b>IMPROVEMENT</b>"]
     ]
     
+    # Get optimal production
+    opt_production = interp_optimal_production(analysis)
+    
     # Add parameter rows based on lift type
     if lift_type == "Gas Lift":
-        param_data.extend([
-            ["Gas Injection Rate", 
-             f"{metrics.get('avg_gas_injection', 'N/A'):.2f}",
-             f"{metrics.get('opt_gas_injection', 'N/A'):.2f}",
-             "units/day",
-             calculate_improvement(metrics.get('avg_gas_injection'), metrics.get('opt_gas_injection'))],
-            ["Oil Production Rate", 
-             f"{metrics.get('avg_oil_rate', 'N/A'):.2f}",
-             f"{metrics.interp_optimal_production(analysis):.2f}",
-             "units/day",
-             calculate_improvement(metrics.get('avg_oil_rate'), metrics.interp_optimal_production(analysis))],
-            ["System Efficiency", 
-             f"{metrics.get('current_efficiency', 'N/A'):.4f}",
-             f"{metrics.get('optimal_efficiency', 'N/A'):.4f}",
-             "q/inj",
-             calculate_improvement(metrics.get('current_efficiency'), metrics.get('optimal_efficiency'), True)]
-        ])
+        avg_inj = metrics.get('avg_gas_injection')
+        opt_inj = metrics.get('opt_gas_injection')
+        avg_rate = metrics.get('avg_oil_rate')
+        curr_eff = metrics.get('current_efficiency')
+        opt_eff = metrics.get('optimal_efficiency')
+        
+        if avg_inj is not None and opt_inj is not None:
+            param_data.append([
+                "Gas Injection Rate", 
+                f"{avg_inj:.2f}",
+                f"{opt_inj:.2f}",
+                "units/day",
+                calculate_improvement(avg_inj, opt_inj)
+            ])
+        
+        if avg_rate is not None and opt_production:
+            param_data.append([
+                "Oil Production Rate", 
+                f"{avg_rate:.2f}",
+                f"{opt_production:.2f}",
+                "units/day",
+                calculate_improvement(avg_rate, opt_production)
+            ])
+        
+        if curr_eff is not None and opt_eff is not None:
+            param_data.append([
+                "System Efficiency", 
+                f"{curr_eff:.4f}",
+                f"{opt_eff:.4f}",
+                "q/inj",
+                calculate_improvement(curr_eff, opt_eff, True)
+            ])
+            
     elif lift_type == "ESP":
-        param_data.extend([
-            ["Operating Frequency", 
-             f"{metrics.get('avg_frequency', 'N/A'):.2f}",
-             f"{metrics.get('opt_frequency', 'N/A'):.2f}",
-             "Hz",
-             calculate_improvement(metrics.get('avg_frequency'), metrics.get('opt_frequency'))],
-            ["Oil Production Rate", 
-             f"{metrics.get('avg_oil_rate', 'N/A'):.2f}",
-             f"{metrics.interp_optimal_production(analysis):.2f}",
-             "units/day",
-             calculate_improvement(metrics.get('avg_oil_rate'), metrics.interp_optimal_production(analysis))],
-            ["System Efficiency", 
-             f"{metrics.get('system_efficiency', 'N/A'):.1f}%" if metrics.get('system_efficiency') else "N/A",
-             "Optimized",
-             "%",
-             "To be measured"]
-        ])
+        avg_freq = metrics.get('avg_frequency')
+        opt_freq = metrics.get('opt_frequency')
+        avg_rate = metrics.get('avg_oil_rate')
+        sys_eff = metrics.get('system_efficiency')
+        
+        if avg_freq is not None and opt_freq is not None:
+            param_data.append([
+                "Operating Frequency", 
+                f"{avg_freq:.2f}",
+                f"{opt_freq:.2f}",
+                "Hz",
+                calculate_improvement(avg_freq, opt_freq)
+            ])
+        
+        if avg_rate is not None and opt_production:
+            param_data.append([
+                "Oil Production Rate", 
+                f"{avg_rate:.2f}",
+                f"{opt_production:.2f}",
+                "units/day",
+                calculate_improvement(avg_rate, opt_production)
+            ])
+        
+        if sys_eff is not None:
+            param_data.append([
+                "System Efficiency", 
+                f"{sys_eff:.1f}%",
+                "Optimized",
+                "%",
+                "To be measured"
+            ])
+            
     elif lift_type == "PCP":
-        param_data.extend([
-            ["Operating RPM", 
-             f"{metrics.get('avg_rpm', 'N/A'):.2f}",
-             f"{metrics.get('opt_rpm', 'N/A'):.2f}",
-             "RPM",
-             calculate_improvement(metrics.get('avg_rpm'), metrics.get('opt_rpm'))],
-            ["Oil Production Rate", 
-             f"{metrics.get('avg_oil_rate', 'N/A'):.2f}",
-             f"{metrics.interp_optimal_production(analysis):.2f}",
-             "units/day",
-             calculate_improvement(metrics.get('avg_oil_rate'), metrics.interp_optimal_production(analysis))],
-            ["Elastomer Stress", 
-             f"{metrics.get('avg_torque', 'N/A'):.1f}" if metrics.get('avg_torque') else "N/A",
-             "Reduced",
-             "psi",
-             "Wear minimized"]
-        ])
+        avg_rpm = metrics.get('avg_rpm')
+        opt_rpm = metrics.get('opt_rpm')
+        avg_rate = metrics.get('avg_oil_rate')
+        avg_torque = metrics.get('avg_torque')
+        
+        if avg_rpm is not None and opt_rpm is not None:
+            param_data.append([
+                "Operating RPM", 
+                f"{avg_rpm:.2f}",
+                f"{opt_rpm:.2f}",
+                "RPM",
+                calculate_improvement(avg_rpm, opt_rpm)
+            ])
+        
+        if avg_rate is not None and opt_production:
+            param_data.append([
+                "Oil Production Rate", 
+                f"{avg_rate:.2f}",
+                f"{opt_production:.2f}",
+                "units/day",
+                calculate_improvement(avg_rate, opt_production)
+            ])
+        
+        if avg_torque is not None:
+            param_data.append([
+                "Avg Torque", 
+                f"{avg_torque:.1f}",
+                "Reduced",
+                "lb-ft",
+                "Wear minimized"
+            ])
     
     # Add productivity index if available
-    if metrics.get('productivity_index'):
+    pi = metrics.get('productivity_index')
+    if pi is not None:
         param_data.append([
             "Productivity Index (PI)",
-            f"{metrics.get('productivity_index', 'N/A'):.4f}",
+            f"{pi:.4f}",
             "N/A",
             "units/day/psi",
             "Baseline"
+        ])
+    
+    # Add data quality if available
+    data_quality = metrics.get('data_quality_score')
+    if data_quality is not None:
+        param_data.append([
+            "Data Quality",
+            f"{(data_quality * 100):.1f}%",
+            "100% target",
+            "%",
+            f"+{(100 - data_quality * 100):.1f}%"
         ])
     
     param_table = Table(param_data, colWidths=[120, 90, 90, 60, 80])
@@ -1295,13 +1417,13 @@ def create_professional_pdf(analysis):
     # Add summary rows
     summary_rows = [
         ["Input Data Columns", 
-         extract_column_names(analysis), 
+         "t, q, control_var", 
          "Original data columns analyzed"],
         ["Data Points", 
          f"{metrics.get('data_points', 'N/A')} measurements", 
          "Valid measurements analyzed"],
         ["Data Quality", 
-         f"{(metrics.get('data_quality_score', 0) * 100):.1f}%", 
+         f"{(metrics.get('data_quality_score', 0) * 100):.1f}%" if metrics.get('data_quality_score') else "N/A", 
          "Data validation score"],
         ["Time Period", 
          extract_time_range(analysis), 
@@ -1379,7 +1501,7 @@ def format_optimal_point(analysis, metrics):
     elif lift_type == "PCP" and metrics.get('opt_rpm'):
         return f"{metrics['opt_rpm']:.2f} RPM operating speed"
     else:
-        return "N/A"
+        return "To be optimized"
 
 def calculate_improvement(current, optimal, is_efficiency=False):
     """Calculate improvement percentage"""
@@ -1408,12 +1530,6 @@ def calculate_improvement(current, optimal, is_efficiency=False):
     except:
         return "N/A"
 
-def extract_column_names(analysis):
-    """Extract column names from analysis"""
-    # This would typically come from the original data
-    # For now, return a placeholder
-    return "t, q, control_var"
-
 def extract_time_range(analysis):
     """Extract time range from analysis"""
     plots = analysis.get("plots", {})
@@ -1426,32 +1542,16 @@ def extract_time_range(analysis):
 
 def extract_production_range(metrics):
     """Extract production range from metrics"""
-    if metrics.get('avg_oil_rate') and metrics.get('max_oil_rate'):
-        avg = metrics['avg_oil_rate']
-        max_val = metrics['max_oil_rate']
-        min_est = avg * 0.5  # Estimate minimum
-        return f"{min_est:.0f} - {max_val:.0f} units/day"
+    avg_rate = metrics.get('avg_oil_rate')
+    max_rate = metrics.get('max_oil_rate')
+    
+    if avg_rate and max_rate:
+        min_est = avg_rate * 0.5  # Estimate minimum
+        return f"{min_est:.0f} - {max_rate:.0f} units/day"
+    elif max_rate:
+        return f"Up to {max_rate:.0f} units/day"
     return "N/A"
 
-def metrics_interp_optimal_production(analysis):
-    """Interpolate production at optimal point"""
-    plots = analysis.get("plots", {})
-    opt = plots.get("opt_curve", {})
-    
-    if opt.get('opt_point') and len(opt['opt_point']) == 2:
-        return opt['opt_point'][1]
-    
-    # Fallback calculation
-    metrics = analysis.get("metrics", {})
-    if metrics.get('avg_oil_rate'):
-        return metrics['avg_oil_rate'] * 1.1  # 10% improvement estimate
-    
-    return "N/A"
-
-# Monkey patch for convenience
-import types
-def interp_optimal_production(self, analysis):
-    return metrics_interp_optimal_production(analysis)
 
 # ========== API ENDPOINTS ==========
 
@@ -1511,11 +1611,6 @@ def download_report():
 
         analysis = data["analysis"]
         
-        # Add helper method to metrics dict
-        metrics = analysis.get("metrics", {})
-        metrics.interp_optimal_production = types.MethodType(interp_optimal_production, metrics)
-        analysis["metrics"] = metrics
-
         buffer = create_professional_pdf(analysis)
 
         ts = datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
