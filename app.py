@@ -13,17 +13,23 @@ from flask_cors import CORS
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, 
-    Image, PageBreak
+    Image, PageBreak, KeepTogether
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch, cm
 from reportlab.platypus.flowables import Spacer
 from reportlab.pdfgen import canvas
-from reportlab.graphics.shapes import Drawing, Line
+from reportlab.graphics.shapes import Drawing, Line, Rect
 from reportlab.graphics.charts.lineplots import LinePlot
 from reportlab.graphics.charts.legends import Legend
 from reportlab.graphics import renderPDF
+from reportlab.graphics.charts.textlabels import Label
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+import base64
 
 app = Flask(__name__)
 CORS(app)
@@ -1082,6 +1088,66 @@ def auto_detect_lift_type(df):
 
 # ========== ENHANCED PDF REPORT FUNCTIONS ==========
 
+def create_matplotlib_plot(analysis, plot_type="time_series"):
+    """Create matplotlib plot and return as base64 image"""
+    plots = analysis.get("plots", {})
+    
+    if plot_type == "time_series":
+        ts = plots.get("time_series", {})
+        t_data = ts.get("t", [])
+        q_data = ts.get("q_oil", [])
+        
+        if len(t_data) < 2 or len(q_data) < 2:
+            return None
+            
+        fig, ax = plt.subplots(figsize=(3.5, 2.5))
+        ax.plot(t_data, q_data, 'b-', linewidth=1.5, alpha=0.7)
+        ax.set_xlabel('Time / Index', fontsize=8)
+        ax.set_ylabel('Oil Rate', fontsize=8)
+        ax.set_title('Production Time Series', fontsize=9, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=7)
+        plt.tight_layout()
+        
+    elif plot_type == "opt_curve":
+        opt = plots.get("opt_curve", {})
+        x_data = opt.get("x", [])
+        y_data = opt.get("y", [])
+        y_smooth = opt.get("y_smooth", [])
+        opt_point = opt.get("opt_point")
+        
+        if len(x_data) < 2 or len(y_data) < 2:
+            return None
+            
+        fig, ax = plt.subplots(figsize=(3.5, 2.5))
+        ax.scatter(x_data, y_data, alpha=0.5, s=10, color='blue', label='Data')
+        
+        if len(y_smooth) == len(x_data):
+            ax.plot(x_data, y_smooth, 'r-', linewidth=2, label='AI Fit')
+        
+        if opt_point and len(opt_point) == 2:
+            ax.scatter([opt_point[0]], [opt_point[1]], color='green', 
+                      s=80, marker='*', label='Optimal Point', zorder=5)
+        
+        ax.set_xlabel(opt.get('xlabel', 'Control Variable'), fontsize=8)
+        ax.set_ylabel(opt.get('ylabel', 'Oil Rate'), fontsize=8)
+        ax.set_title('Optimization Curve', fontsize=9, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7)
+        ax.tick_params(labelsize=7)
+        plt.tight_layout()
+    
+    # Save to buffer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    buf.seek(0)
+    
+    # Convert to base64
+    img_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    return img_base64
+
+
 def create_professional_pdf(analysis):
     """Create a professional PDF report matching the DCA report style"""
     buffer = io.BytesIO()
@@ -1125,6 +1191,16 @@ def create_professional_pdf(analysis):
         fontSize=10,
         spaceAfter=6,
         textColor=colors.HexColor('#2d3748')
+    )
+    
+    # Key findings style (without bold tags in text)
+    keyfindings_style = ParagraphStyle(
+        'KeyFindings',
+        parent=styles['Normal'],
+        fontSize=10,
+        spaceAfter=4,
+        textColor=colors.HexColor('#2d3748'),
+        leftIndent=20
     )
     
     doc = SimpleDocTemplate(buffer, pagesize=A4, 
@@ -1182,33 +1258,34 @@ def create_professional_pdf(analysis):
     lift_type = analysis.get("lift_type", "Unknown")
     metrics = analysis.get("metrics", {})
     
+    # Create Key Findings table with proper formatting
     key_findings_data = []
     
     # Best-fitting Lift Type
-    key_findings_data.append(["• <b>Best-fitting Lift Type:</b>", f"<b>{lift_type}</b>"])
+    key_findings_data.append(["• Best-fitting Lift Type:", f"{lift_type}"])
     
     # AI Optimal Operating Point
     optimal_point = format_optimal_point(analysis, metrics)
-    key_findings_data.append(["• <b>AI Optimal Operating Point:</b>", optimal_point])
+    key_findings_data.append(["• AI Optimal Operating Point:", optimal_point])
     
     # Data Points Analyzed
     data_points = metrics.get('data_points', 'N/A')
-    key_findings_data.append(["• <b>Data Points Analyzed:</b>", f"{data_points} measurements"])
+    key_findings_data.append(["• Data Points Analyzed:", f"{data_points} measurements"])
     
     # Data Quality Score
     data_quality = metrics.get('data_quality_score', 0)
     if data_quality:
-        key_findings_data.append(["• <b>Data Quality Score:</b>", f"{(data_quality * 100):.1f}%"])
+        key_findings_data.append(["• Data Quality Score:", f"{(data_quality * 100):.1f}%"])
     
     # Current Average Production
     avg_rate = metrics.get('avg_oil_rate')
     if avg_rate:
-        key_findings_data.append(["• <b>Current Average Production:</b>", f"{avg_rate:.2f} units/day"])
+        key_findings_data.append(["• Current Average Production:", f"{avg_rate:.2f} units/day"])
     
     # Maximum Historical Production
     max_rate = metrics.get('max_oil_rate')
     if max_rate:
-        key_findings_data.append(["• <b>Maximum Historical Production:</b>", f"{max_rate:.2f} units/day"])
+        key_findings_data.append(["• Maximum Historical Production:", f"{max_rate:.2f} units/day"])
     
     findings_table = Table(key_findings_data, colWidths=[250, 150])
     findings_table.setStyle(TableStyle([
@@ -1216,6 +1293,7 @@ def create_professional_pdf(analysis):
         ('LEFTPADDING', (0, 0), (-1, -1), 0),
         ('RIGHTPADDING', (0, 0), (-1, -1), 10),
         ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+        ('FONTSIZE', (0, 0), (-1, -1), 10),
     ]))
     
     story.append(findings_table)
@@ -1232,14 +1310,45 @@ def create_professional_pdf(analysis):
     story.append(Paragraph(model_comp_text, normal_style))
     story.append(Spacer(1, 20))
     
+    # Create small plots
+    try:
+        # Create time series plot
+        time_plot_img = create_matplotlib_plot(analysis, "time_series")
+        opt_plot_img = create_matplotlib_plot(analysis, "opt_curve")
+        
+        if time_plot_img and opt_plot_img:
+            # Create table with two plots side by side
+            plot_table_data = [
+                ["Time Series Plot", "Optimization Curve"],
+                [Image(io.BytesIO(base64.b64decode(time_plot_img)), width=3.5*inch, height=2.5*inch),
+                 Image(io.BytesIO(base64.b64decode(opt_plot_img)), width=3.5*inch, height=2.5*inch)]
+            ]
+            
+            plot_table = Table(plot_table_data, colWidths=[3.5*inch, 3.5*inch])
+            plot_table.setStyle(TableStyle([
+                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                ('ALIGN', (0, 1), (-1, 1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 9),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 5),
+                ('TOPPADDING', (0, 1), (-1, 1), 5),
+            ]))
+            
+            story.append(plot_table)
+            story.append(Spacer(1, 20))
+    except Exception as e:
+        print(f"Error creating plots: {e}")
+        # Continue without plots if there's an error
+    
     # Individual Model Analysis
     story.append(Paragraph("INDIVIDUAL MODEL ANALYSIS", subheader_style))
     story.append(Spacer(1, 10))
     
     models = [
-        "• <b>Machine Learning Optimization:</b> Random Forest regression for complex pattern recognition",
-        "• <b>Physics-based Optimization:</b> Vogel-type analysis and system efficiency calculations",
-        "• <b>Economic Optimization:</b> Cost-benefit analysis considering operational expenses"
+        "• Machine Learning Optimization: Random Forest regression for complex pattern recognition",
+        "• Physics-based Optimization: Vogel-type analysis and system efficiency calculations",
+        "• Economic Optimization: Cost-benefit analysis considering operational expenses"
     ]
     
     for model in models:
@@ -1256,7 +1365,7 @@ def create_professional_pdf(analysis):
     
     # Main parameters table
     param_data = [
-        ["<b>PARAMETER</b>", "<b>CURRENT VALUE</b>", "<b>AI OPTIMAL VALUE</b>", "<b>UNIT</b>", "<b>IMPROVEMENT</b>"]
+        ["PARAMETER", "CURRENT VALUE", "AI OPTIMAL VALUE", "UNIT", "IMPROVEMENT"]
     ]
     
     # Get optimal production
@@ -1411,7 +1520,7 @@ def create_professional_pdf(analysis):
     story.append(Spacer(1, 15))
     
     summary_data = [
-        ["<b>PARAMETER</b>", "<b>VALUE</b>", "<b>DESCRIPTION</b>"]
+        ["PARAMETER", "VALUE", "DESCRIPTION"]
     ]
     
     # Add summary rows
