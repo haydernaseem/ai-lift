@@ -1149,7 +1149,7 @@ def create_matplotlib_plot(analysis, plot_type="time_series"):
 
 
 def create_professional_pdf(analysis):
-    """Create a professional PDF report matching the DCA report style"""
+    """Create a professional PDF report - 2 PAGES ONLY"""
     buffer = io.BytesIO()
     
     # Create custom styles
@@ -1160,8 +1160,8 @@ def create_professional_pdf(analysis):
         'CustomTitle',
         parent=styles['Title'],
         fontSize=24,
-        spaceAfter=15,  # تقليل المسافة
-        alignment=1,  # Center
+        spaceAfter=15,
+        alignment=1,
         textColor=colors.HexColor('#1a365d')
     )
     
@@ -1170,7 +1170,7 @@ def create_professional_pdf(analysis):
         'CustomHeader',
         parent=styles['Heading1'],
         fontSize=14,
-        spaceAfter=8,  # تقليل المسافة
+        spaceAfter=8,
         textColor=colors.HexColor('#2d3748'),
         fontName='Helvetica-Bold'
     )
@@ -1180,7 +1180,7 @@ def create_professional_pdf(analysis):
         'CustomSubHeader',
         parent=styles['Heading2'],
         fontSize=12,
-        spaceAfter=6,  # تقليل المسافة
+        spaceAfter=6,
         textColor=colors.HexColor('#4a5568')
     )
     
@@ -1189,7 +1189,7 @@ def create_professional_pdf(analysis):
         'CustomNormal',
         parent=styles['Normal'],
         fontSize=10,
-        spaceAfter=4,  # تقليل المسافة
+        spaceAfter=4,
         textColor=colors.HexColor('#2d3748')
     )
     
@@ -1198,22 +1198,22 @@ def create_professional_pdf(analysis):
         'KeyFindings',
         parent=styles['Normal'],
         fontSize=10,
-        spaceAfter=3,  # تقليل المسافة
+        spaceAfter=3,
         textColor=colors.HexColor('#2d3748'),
         leftIndent=20
     )
     
     doc = SimpleDocTemplate(buffer, pagesize=A4, 
                           rightMargin=72, leftMargin=72,
-                          topMargin=60, bottomMargin=72)  # تقليل topMargin
+                          topMargin=60, bottomMargin=72)
     
     story = []
     
     # ===== PAGE 1 =====
     
-    # Report title - المسافة بين العنوان والمعلومات أقل
+    # Report title
     story.append(Paragraph("AI LIFT OPTIMIZATION REPORT", title_style))
-    story.append(Spacer(1, 10))  # تقليل
+    story.append(Spacer(1, 10))
     
     # Report info
     report_date = datetime.datetime.utcnow().strftime("%B %d, %Y")
@@ -1231,16 +1231,16 @@ def create_professional_pdf(analysis):
         ('FONTSIZE', (0, 1), (0, 1), 10),
         ('TEXTCOLOR', (0, 0), (0, 0), colors.HexColor('#2d3748')),
         ('TEXTCOLOR', (0, 1), (0, 1), colors.HexColor('#4a5568')),
-        ('BOTTOMPADDING', (0, 0), (0, 0), 5),  # تقليل
-        ('BOTTOMPADDING', (0, 1), (0, 1), 15),  # تقليل
+        ('BOTTOMPADDING', (0, 0), (0, 0), 5),
+        ('BOTTOMPADDING', (0, 1), (0, 1), 15),
     ]))
     
     story.append(info_table)
-    story.append(Spacer(1, 20))  # تقليل
+    story.append(Spacer(1, 20))
     
     # Executive Summary header
     story.append(Paragraph("EXECUTIVE SUMMARY", header_style))
-    story.append(Spacer(1, 6))  # تقليل
+    story.append(Spacer(1, 6))
     
     # Executive Summary content
     exec_summary = f"""
@@ -1249,11 +1249,11 @@ def create_professional_pdf(analysis):
     economic optimization to determine the optimal operating parameters for maximum efficiency.
     """
     story.append(Paragraph(exec_summary, normal_style))
-    story.append(Spacer(1, 15))  # تقليل
+    story.append(Spacer(1, 15))
     
     # Key Findings
     story.append(Paragraph("KEY FINDINGS:", subheader_style))
-    story.append(Spacer(1, 8))  # تقليل
+    story.append(Spacer(1, 8))
     
     lift_type = analysis.get("lift_type", "Unknown")
     metrics = analysis.get("metrics", {})
@@ -1292,25 +1292,25 @@ def create_professional_pdf(analysis):
         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
         ('LEFTPADDING', (0, 0), (-1, -1), 0),
         ('RIGHTPADDING', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),  # تقليل
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
         ('FONTSIZE', (0, 0), (-1, -1), 10),
     ]))
     
     story.append(findings_table)
-    story.append(Spacer(1, 20))  # تقليل
+    story.append(Spacer(1, 20))
     
     # Model Comparison Analysis header
     story.append(Paragraph("AI MODEL COMPARISON ANALYSIS", header_style))
-    story.append(Spacer(1, 8))  # تقليل
+    story.append(Spacer(1, 8))
     
     model_comp_text = """
     The AI analysis compared multiple optimization approaches including machine learning (Random Forest),
     physics-based models, and economic optimization to determine the most reliable optimal operating point.
     """
     story.append(Paragraph(model_comp_text, normal_style))
-    story.append(Spacer(1, 15))  # تقليل
+    story.append(Spacer(1, 15))
     
-    # Create small plots - سحب الرسم لأعلى
+    # Create small plots
     try:
         # Create time series plot
         time_plot_img = create_matplotlib_plot(analysis, "time_series")
@@ -1331,26 +1331,24 @@ def create_professional_pdf(analysis):
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
                 ('FONTSIZE', (0, 0), (-1, 0), 9),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 4),  # تقليل
-                ('TOPPADDING', (0, 1), (-1, 1), 4),  # تقليل
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 4),
+                ('TOPPADDING', (0, 1), (-1, 1), 4),
             ]))
             
             story.append(plot_table)
-            story.append(Spacer(1, 15))  # تقليل
+            story.append(Spacer(1, 15))
     except Exception as e:
         print(f"Error creating plots: {e}")
         # Continue without plots if there's an error
     
-    # ===== نقل INDIVIDUAL MODEL ANALYSIS إلى الصفحة الثانية =====
-    # تم حذف INDIVIDUAL MODEL ANALYSIS من الصفحة الأولى بالكامل
-    
+    # ===== PAGE BREAK =====
     story.append(PageBreak())
     
-    # ===== PAGE 2 =====
+    # ===== PAGE 2 (المحتوى الذي كان في الصفحة الثالثة) =====
     
     # MODEL PARAMETERS AND STATISTICS
     story.append(Paragraph("MODEL PARAMETERS AND STATISTICS", header_style))
-    story.append(Spacer(1, 10))  # تقليل
+    story.append(Spacer(1, 10))
     
     # Main parameters table
     param_data = [
@@ -1497,16 +1495,16 @@ def create_professional_pdf(analysis):
         ('FONTSIZE', (0, 1), (-1, -1), 9),
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
         
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),  # تقليل
-        ('TOPPADDING', (0, 0), (-1, -1), 5),  # تقليل
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
     ]))
     
     story.append(param_table)
-    story.append(Spacer(1, 25))  # تقليل
+    story.append(Spacer(1, 25))
     
     # ANALYSIS SUMMARY
     story.append(Paragraph("ANALYSIS SUMMARY", header_style))
-    story.append(Spacer(1, 10))  # تقليل
+    story.append(Spacer(1, 10))
     
     summary_data = [
         ["PARAMETER", "VALUE", "DESCRIPTION"]
@@ -1555,12 +1553,12 @@ def create_professional_pdf(analysis):
         ('FONTSIZE', (0, 1), (-1, -1), 9),
         ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f7fafc')]),
         
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),  # تقليل
-        ('TOPPADDING', (0, 0), (-1, -1), 5),  # تقليل
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+        ('TOPPADDING', (0, 0), (-1, -1), 5),
     ]))
     
     story.append(summary_table)
-    story.append(Spacer(1, 20))  # تقليل
+    story.append(Spacer(1, 20))
     
     # Footer
     footer_text = """
@@ -1579,7 +1577,7 @@ def create_professional_pdf(analysis):
         parent=styles['Normal'],
         fontSize=8,
         textColor=colors.HexColor('#718096'),
-        alignment=1  # Center
+        alignment=1
     )))
     
     # Build PDF
