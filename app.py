@@ -1336,7 +1336,6 @@ def create_professional_pdf(analysis):
             ]))
             
             story.append(plot_table)
-            story.append(Spacer(1, 15))
     except Exception as e:
         print(f"Error creating plots: {e}")
         # Continue without plots if there's an error
