@@ -1149,7 +1149,7 @@ def create_matplotlib_plot(analysis, plot_type="time_series"):
 
 
 def create_professional_pdf(analysis):
-    """Create a professional PDF report - 2 PAGES ONLY"""
+    """Create a professional PDF report - EXACTLY 2 PAGES FOR ALL LIFT TYPES"""
     buffer = io.BytesIO()
     
     # Create custom styles
@@ -1310,7 +1310,7 @@ def create_professional_pdf(analysis):
     story.append(Paragraph(model_comp_text, normal_style))
     story.append(Spacer(1, 15))
     
-    # Create small plots
+    # Create small plots ONLY - NO EXTRA CONTENT
     try:
         # Create time series plot
         time_plot_img = create_matplotlib_plot(analysis, "time_series")
@@ -1344,13 +1344,13 @@ def create_professional_pdf(analysis):
     # ===== PAGE BREAK =====
     story.append(PageBreak())
     
-    # ===== PAGE 2 (المحتوى الذي كان في الصفحة الثالثة) =====
+    # ===== PAGE 2 =====
     
     # MODEL PARAMETERS AND STATISTICS
     story.append(Paragraph("MODEL PARAMETERS AND STATISTICS", header_style))
     story.append(Spacer(1, 10))
     
-    # Main parameters table
+    # Main parameters table - SIMPLIFIED FOR ALL LIFT TYPES
     param_data = [
         ["PARAMETER", "CURRENT VALUE", "AI OPTIMAL VALUE", "UNIT", "IMPROVEMENT"]
     ]
@@ -1358,11 +1358,21 @@ def create_professional_pdf(analysis):
     # Get optimal production
     opt_production = interp_optimal_production(analysis)
     
-    # Add parameter rows based on lift type
+    # COMMON PARAMETERS FOR ALL LIFT TYPES
+    avg_rate = metrics.get('avg_oil_rate')
+    if avg_rate is not None and opt_production:
+        param_data.append([
+            "Oil Production Rate", 
+            f"{avg_rate:.2f}",
+            f"{opt_production:.2f}",
+            "units/day",
+            calculate_improvement(avg_rate, opt_production)
+        ])
+    
+    # LIFT-SPECIFIC PARAMETERS
     if lift_type == "Gas Lift":
         avg_inj = metrics.get('avg_gas_injection')
         opt_inj = metrics.get('opt_gas_injection')
-        avg_rate = metrics.get('avg_oil_rate')
         curr_eff = metrics.get('current_efficiency')
         opt_eff = metrics.get('optimal_efficiency')
         
@@ -1373,15 +1383,6 @@ def create_professional_pdf(analysis):
                 f"{opt_inj:.2f}",
                 "units/day",
                 calculate_improvement(avg_inj, opt_inj)
-            ])
-        
-        if avg_rate is not None and opt_production:
-            param_data.append([
-                "Oil Production Rate", 
-                f"{avg_rate:.2f}",
-                f"{opt_production:.2f}",
-                "units/day",
-                calculate_improvement(avg_rate, opt_production)
             ])
         
         if curr_eff is not None and opt_eff is not None:
@@ -1396,7 +1397,6 @@ def create_professional_pdf(analysis):
     elif lift_type == "ESP":
         avg_freq = metrics.get('avg_frequency')
         opt_freq = metrics.get('opt_frequency')
-        avg_rate = metrics.get('avg_oil_rate')
         sys_eff = metrics.get('system_efficiency')
         
         if avg_freq is not None and opt_freq is not None:
@@ -1406,15 +1406,6 @@ def create_professional_pdf(analysis):
                 f"{opt_freq:.2f}",
                 "Hz",
                 calculate_improvement(avg_freq, opt_freq)
-            ])
-        
-        if avg_rate is not None and opt_production:
-            param_data.append([
-                "Oil Production Rate", 
-                f"{avg_rate:.2f}",
-                f"{opt_production:.2f}",
-                "units/day",
-                calculate_improvement(avg_rate, opt_production)
             ])
         
         if sys_eff is not None:
@@ -1429,7 +1420,6 @@ def create_professional_pdf(analysis):
     elif lift_type == "PCP":
         avg_rpm = metrics.get('avg_rpm')
         opt_rpm = metrics.get('opt_rpm')
-        avg_rate = metrics.get('avg_oil_rate')
         avg_torque = metrics.get('avg_torque')
         
         if avg_rpm is not None and opt_rpm is not None:
@@ -1439,15 +1429,6 @@ def create_professional_pdf(analysis):
                 f"{opt_rpm:.2f}",
                 "RPM",
                 calculate_improvement(avg_rpm, opt_rpm)
-            ])
-        
-        if avg_rate is not None and opt_production:
-            param_data.append([
-                "Oil Production Rate", 
-                f"{avg_rate:.2f}",
-                f"{opt_production:.2f}",
-                "units/day",
-                calculate_improvement(avg_rate, opt_production)
             ])
         
         if avg_torque is not None:
@@ -1502,7 +1483,7 @@ def create_professional_pdf(analysis):
     story.append(param_table)
     story.append(Spacer(1, 25))
     
-    # ANALYSIS SUMMARY
+    # ANALYSIS SUMMARY - SIMPLIFIED
     story.append(Paragraph("ANALYSIS SUMMARY", header_style))
     story.append(Spacer(1, 10))
     
@@ -1510,13 +1491,10 @@ def create_professional_pdf(analysis):
         ["PARAMETER", "VALUE", "DESCRIPTION"]
     ]
     
-    # Add summary rows
+    # Add summary rows - SIMPLIFIED
     summary_rows = [
-        ["Input Data Columns", 
-         "t, q, control_var", 
-         "Original data columns analyzed"],
         ["Data Points", 
-         f"{metrics.get('data_points', 'N/A')} measurements", 
+         f"{metrics.get('data_points', 'N/A')}", 
          "Valid measurements analyzed"],
         ["Data Quality", 
          f"{(metrics.get('data_quality_score', 0) * 100):.1f}%" if metrics.get('data_quality_score') else "N/A", 
@@ -1526,11 +1504,8 @@ def create_professional_pdf(analysis):
          "Analysis time range"],
         ["Production Range", 
          extract_production_range(metrics), 
-         "Historical production variation"],
-        ["AI Confidence", 
-         "Advanced ML + Physics", 
-         "Optimization methodology"],
-        ["Best Model", 
+         "Historical variation"],
+        ["AI Model", 
          f"{lift_type} - AI Optimized", 
          "Selected optimization approach"]
     ]
